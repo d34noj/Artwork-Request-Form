@@ -383,6 +383,23 @@ def request_status(rec, hist):
     return f"Given to {drawn[0]}" if drawn else ("Waiting" if rows else "Not found on schedule")
 
 
+def has_pdf():
+    try:
+        import reportlab  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def pdf_button(where, label, rec, key, **kw):
+    """PDF download, or a note if reportlab isn't installed (needs 'reportlab' in requirements.txt)."""
+    if has_pdf():
+        where.download_button(label, request_pdf(rec), f"Artwork request {rec.get('Ref')} {rec.get('Job No')}.pdf",
+                              "application/pdf", key=key, **kw)
+    else:
+        where.caption("PDF request sheet: add a line saying reportlab to requirements.txt on GitHub.")
+
+
 def request_pdf(rec):
     """One A4 page per request - for the job file / printing."""
     import io
@@ -453,8 +470,7 @@ def saved_screen():
         c1.markdown(f"> {needed}")
         if r.get("Clarity folder"):
             c1.code(r["Clarity folder"], language=None)
-        c2.download_button("Download request sheet (PDF)", request_pdf(r), f"Artwork request {r.get('Ref')} {r.get('Job No')}.pdf",
-                           "application/pdf", type="primary", key="sv_pdf")
+        pdf_button(c2, "Download request sheet (PDF)", r, "sv_pdf", type="primary")
 
 
 # --------------------------------------------------------------------------------------
@@ -532,8 +548,7 @@ def new_request():
             if b1.button("New request", type="primary", key="nr_again", use_container_width=True):
                 clear_form()
                 st.rerun()
-            b2.download_button("Request sheet (PDF)", request_pdf(done), f"Artwork request {done['Ref']} {done['Job No']}.pdf",
-                               "application/pdf", key="nr_pdf", use_container_width=True)
+            pdf_button(b2, "Request sheet (PDF)", done, "nr_pdf", use_container_width=True)
         return
     with st.container(border=True):
         _new_request()
