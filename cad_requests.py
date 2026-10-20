@@ -207,10 +207,18 @@ def unallocated_from(title, values):
 @st.cache_resource(show_spinner=False)
 def book():
     import gspread
-    creds = _secret("gcp_service_account")
+    import json
+    raw = _secret("gcp_json")                    # easiest: the whole downloaded .json pasted in Secrets as gcp_json
+    creds = json.loads(raw) if raw else _secret("gcp_service_account")
     if not creds:
-        raise RuntimeError("No Google key set up yet - see SETUP.txt (gcp_service_account in the app's secrets).")
-    return gspread.service_account_from_dict(dict(creds)).open_by_key(SHEET_ID)
+        raise RuntimeError("No Google key set up yet - see SETUP.txt (gcp_json in the app's Secrets).")
+    creds = dict(creds)
+    key = str(creds.get("private_key", ""))
+    if "..." in key or "BEGIN PRIVATE KEY" not in key:
+        raise RuntimeError("The private_key in Secrets is still the example text - paste the real key from the .json file "
+                           "(easiest: paste the whole .json as gcp_json, see SETUP.txt).")
+    creds["private_key"] = key.replace("\\n", "\n")         # key pasted with literal \n's
+    return gspread.service_account_from_dict(creds).open_by_key(SHEET_ID)
 
 
 def ws(title):
@@ -422,12 +430,17 @@ def find_job():
 # --------------------------------------------------------------------------------------
 # Page
 # --------------------------------------------------------------------------------------
-pw = _secret("app_password")
+pw = str(_secret("app_password", "") or "").strip()
 if pw and st.session_state.get("ok") != pw:
     page_style()
-    if st.text_input("Password", type="password") == pw:
-        st.session_state["ok"] = pw
-        st.rerun()
+    with st.form("login"):
+        typed = st.text_input("Password", type="password")
+        go = st.form_submit_button("Log in", type="primary")
+    if go:
+        if typed.strip() == pw:
+            st.session_state["ok"] = pw
+            st.rerun()
+        st.error("Wrong password - it's the app_password set in the app's Secrets.")
     st.stop()
 
 page_style()
