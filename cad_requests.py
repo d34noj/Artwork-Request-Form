@@ -161,6 +161,48 @@ def where_to_put(values, d):
     return i + 1, True                            # insert here, everything below moves down
 
 
+def plan_slot(values, boxed, d):
+    """Where a new line goes under date d, using the day's boxes (boxed = 1-based rows whose Client cell has borders).
+    - an empty boxed line under that date -> fill it
+    - otherwise -> insert a new line straight after the day's last boxed line (above the hours total box),
+      copying that line's boxes, and stretch the SUM in the total box to include it.
+    Returns dict(at, insert, fmt_src, total_row, first) or None if the date has no heading."""
+    month = d.replace(day=1)
+    h = next((i for i, r in enumerate(values) if head_day(r, month) == d), None)
+    if h is None:
+        return None
+    end = next((i for i in range(h + 1, len(values)) if head_day(values[i], month)), len(values))
+    jobs = [i for i in range(h + 1, end) if (i + 1) in boxed]
+    if not jobs:                                   # no boxes found - fall back to the first gap under the date
+        at, insert = where_to_put(values, d)
+        src = next((i + 1 for i in range(min(at, len(values)) - 2, 0, -1) if (i + 1) in boxed or is_job_row(values[i])), None)
+        return {"at": at, "insert": insert, "fmt_src": src, "total_row": None, "first": None}
+    for i in jobs:
+        if is_blank(pad(values[i])[1:C_DWG + 1]):
+            return {"at": i + 1, "insert": False, "fmt_src": None, "total_row": None, "first": jobs[0] + 1}
+    last = max(jobs)
+    total = last + 1 if last + 1 < end and (last + 2) not in boxed and not is_job_row(values[last + 1]) else None
+    return {"at": last + 2, "insert": True, "fmt_src": last + 1, "total_row": (total + 2) if total is not None else None,
+            "first": jobs[0] + 1}
+
+
+def boxed_rows(w, n):
+    """1-based rows whose Client (C) cell has a border - i.e. the schedule's boxes."""
+    try:
+        meta = w.spreadsheet.fetch_sheet_metadata(params={
+            "ranges": f"'{w.title}'!C1:C{max(n, 1) + 5}", "includeGridData": "true",
+            "fields": "sheets.data.rowData.values.userEnteredFormat.borders"})
+        rows = meta["sheets"][0]["data"][0].get("rowData", [])
+    except Exception:
+        return set()
+    out = set()
+    for i, r in enumerate(rows):
+        b = ((r.get("values") or [{}])[0].get("userEnteredFormat") or {}).get("borders") or {}
+        if any((b.get(k) or {}).get("style") not in (None, "NONE") for k in ("top", "bottom", "left", "right")):
+            out.add(i + 1)
+    return out
+
+
 def build_row(job, client, site, pm, hours, notes, folder=""):
     """Columns A-I only - nothing is written past Drw. No."""
     r = [""] * (C_DWG + 1)
@@ -276,15 +318,16 @@ def add_request(d, row, urgent=False):
     if w is None:
         raise RuntimeError(f"There's no '{tab_name(d)}' tab on the schedule yet - make the month tab first.")
     values = w.get_all_values()
-    at = None
+    boxed = boxed_rows(w, len(values))
+    plan = None
     for k in range(7):                       # a weekend / missing date goes under the next date heading in the tab
         day = d + dt.timedelta(days=k)
         if day.month != d.month:
             break
-        at, insert = where_to_put(values, day)
-        if at is not None:
+        plan = plan_slot(values, boxed, day)
+        if plan is not None:
             break
-    if at is None:
+    if plan is None:
         raise RuntimeError(f"Couldn't find the {d.day}-{d:%b} heading (or a later one that week) in '{w.title}'. Add the date to the tab first.")
     for i, x in enumerate(values):           # same request already there, still unallocated -> don't add it twice
         x = pad(x)
@@ -292,17 +335,27 @@ def add_request(d, row, urgent=False):
                 and not x[C_DRAWN].strip() and (row[C_JOB] or row[C_SITE]):
             raise DuplicateRequest(f"That request is already on '{w.title}' (row {i + 1}) and not given out yet - "
                                    "it hasn't been added again.")
-    src = next((i + 1 for i in range(min(at, len(values)) - 2, 0, -1) if is_job_row(values[i])), None)
-    if insert:
+    at = plan["at"]
+    old_total = None
+    if plan["insert"] and plan["total_row"]:
+        try:
+            old_total = w.acell(f"F{plan['total_row'] - 1}", value_render_option="FORMULA").value
+        except Exception:
+            old_total = None
+    if plan["insert"]:
         w.insert_row(row, index=at, value_input_option="USER_ENTERED", inherit_from_before=True)
     else:
         w.update(range_name=f"A{at}:I{at}", values=[row], value_input_option="USER_ENTERED")
-    if src:                                  # same boxes / borders as the job line above it
-        if insert and src >= at:
-            src += 1
+    src = plan["fmt_src"]
+    if src:                                  # same boxes / borders as the line above it
         try:
             g = lambda r: {"sheetId": w.id, "startRowIndex": r - 1, "endRowIndex": r, "startColumnIndex": 0, "endColumnIndex": C_DWG + 1}
             w.spreadsheet.batch_update({"requests": [{"copyPaste": {"source": g(src), "destination": g(at), "pasteType": "PASTE_FORMAT"}}]})
+        except Exception:
+            pass
+    if old_total and str(old_total).upper().startswith("=SUM(") and plan["first"]:
+        try:                                 # hours total box: stretch the SUM to take in the new line
+            w.update(range_name=f"F{plan['total_row']}", values=[[f"=SUM(F{plan['first']}:F{at})"]], value_input_option="USER_ENTERED")
         except Exception:
             pass
     try:                                     # URGENT = whole line in red; otherwise make sure it isn't red from the line above
