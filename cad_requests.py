@@ -161,12 +161,12 @@ def where_to_put(values, d):
     return i + 1, True                            # insert here, everything below moves down
 
 
-def build_row(job, client, site, pm, hours, notes, folder):
-    r = [""] * NCOLS
+def build_row(job, client, site, pm, hours, notes, folder=""):
+    """Columns A-I only - nothing is written past Drw. No."""
+    r = [""] * (C_DWG + 1)
     r[C_JOB], r[C_CLIENT], r[C_SITE], r[C_PM] = str(job).strip(), client.strip(), site.strip(), pm.strip().upper()
     r[C_TIME] = (f"{hours:g}" if isinstance(hours, (int, float)) and hours else str(hours or "")).strip()
     r[C_NOTES] = notes.strip()
-    r[C_FOLDER] = folder_formula(folder) if folder else ""
     return r
 
 
@@ -263,13 +263,15 @@ def latest_for(job):
     return hits[-1] if hits else None
 
 
-def add_request(d, row):
+RED = {"red": 0.86, "green": 0.0, "blue": 0.0}
+BLACK = {"red": 0.0, "green": 0.0, "blue": 0.0}
+
+
+def add_request(d, row, urgent=False):
     w = ws(tab_name(d))
     if w is None:
         raise RuntimeError(f"There's no '{tab_name(d)}' tab on the schedule yet - make the month tab first.")
     values = w.get_all_values()
-    if values and not pad(values[0])[C_FOLDER].strip():
-        w.update(range_name="J1", values=[["Folder"]])
     at = None
     for k in range(7):                       # a weekend / missing date goes under the next date heading in the tab
         day = d + dt.timedelta(days=k)
@@ -283,7 +285,11 @@ def add_request(d, row):
     if insert:
         w.insert_row(row, index=at, value_input_option="USER_ENTERED", inherit_from_before=True)
     else:
-        w.update(range_name=f"A{at}:J{at}", values=[row], value_input_option="USER_ENTERED")
+        w.update(range_name=f"A{at}:I{at}", values=[row], value_input_option="USER_ENTERED")
+    try:                                     # URGENT = whole line in red; otherwise make sure it isn't red from the line above
+        w.format(f"A{at}:I{at}", {"textFormat": {"foregroundColor": RED if urgent else BLACK, "bold": bool(urgent)}})
+    except Exception:
+        pass
     return w.title, at, day
 
 
@@ -319,7 +325,7 @@ def allocate(items):
 # --------------------------------------------------------------------------------------
 LOG_TAB = "Requests Log"
 LOG_COLS = ["Ref", "Submitted", "Job No", "Client", "Site", "Requested by", "Hours", "Required by", "On schedule",
-            "Came by", "What's needed", "Clarity folder", "Schedule tab", "Schedule row"]
+            "Urgent", "What's needed", "Clarity folder", "Schedule tab", "Schedule row"]
 
 
 def uk_now():
@@ -339,7 +345,13 @@ def log_ws():
 
 
 def log_request(rec):
-    log_ws().append_row([str(rec.get(c, "")) for c in LOG_COLS], value_input_option="RAW")
+    w = log_ws()
+    head = [h for h in (w.get_all_values() or [[]])[0] if str(h).strip()]
+    extra = [c for c in LOG_COLS if c not in head]
+    if extra:                                    # older log tab - add any new columns to the end of the header
+        head += extra
+        w.update(range_name="A1", values=[head])
+    w.append_row([str(rec.get(c, "")) for c in head], value_input_option="RAW")
     saved_requests.clear()
 
 
@@ -395,7 +407,7 @@ def request_pdf(rec):
     top = Table(head_cells, colWidths=[124 * mm, 50 * mm])
     top.setStyle(TableStyle([("SPAN", (1, 0), (1, 1)), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (1, 0), (1, 1), "RIGHT"),
                              ("LINEBELOW", (0, 1), (-1, 1), 2, red), ("BOTTOMPADDING", (0, 1), (-1, 1), 8)]))
-    fields = ["Job No", "Client", "Site", "Requested by", "Hours", "Required by", "On schedule", "Came by", "What's needed",
+    fields = ["Job No", "Client", "Site", "Requested by", "Hours", "Required by", "On schedule", "Urgent", "What's needed",
               "Clarity folder"]
     names = {"Job No": "Clarity job no.", "Site": "Site / project", "Hours": "Estimated CAD time (hours)",
              "On schedule": "On the cad schedule under"}
@@ -423,7 +435,7 @@ def saved_screen():
     hist = all_history()
     df = pd.DataFrame([{"Ref": r.get("Ref"), "Submitted": r.get("Submitted"), "Job No": r.get("Job No"), "Client": r.get("Client"),
                         "Site": r.get("Site"), "By": r.get("Requested by"), "Hours": r.get("Hours"), "Required by": r.get("Required by"),
-                        "Status": request_status(r, hist), "What's needed": r.get("What's needed")} for r in recs])
+                        "Urgent": r.get("Urgent", ""), "Status": request_status(r, hist), "What's needed": r.get("What's needed")} for r in recs])
     st.caption(f"{len(df)} request(s), newest first.")
     st.dataframe(df, hide_index=True, use_container_width=True)
     if not recs:
@@ -510,6 +522,8 @@ def new_request():
             if not st.session_state.get("nr_party"):
                 st.session_state["nr_party"] = True
                 logo_party()
+            if done.get("Urgent"):
+                st.error("URGENT - it's in red on the schedule.")
             st.success(f"Request {done['Ref']} sent - it's on the cad schedule ('{done['Schedule tab']}', under "
                        f"{done['On schedule'][:5].replace('/', '-')}) with Drw. by blank, and saved in Saved Requests.")
             needed = done.get("What's needed", "")
@@ -547,18 +561,17 @@ def _new_request():
     day = b3.date_input("Put it on the schedule under", value=today, key="nr_day", format="DD/MM/YYYY")
     details = st.text_area("What's needed", key="nr_details", height=90,
                            placeholder="e.g. Amend wayfinding package in line with client comments received today")
-    how = st.radio("Request came by", ["Email request", "Verbal instruction", "Form only"], horizontal=True, key="nr_how")
+    urgent = st.toggle("URGENT - puts the whole line on the schedule in red", key="nr_urgent")
     folder = folder_path(job, client) if job and client else ""
     if folder:
         st.caption(f"Clarity folder: `{folder}`")
-    notes = " - ".join(x for x in (how if how != "Form only" else "", details.strip(),
-                                   f"Req. by {need:%a %d/%m}" if need else "") if x)
+    notes = details.strip()
     missing = [n for n, v in (("job no. or site", job or site), ("client", client), ("your initials", pm), ("what's needed", details))
                if not str(v).strip()]
     if st.button("Submit request", type="primary", key="nr_go", disabled=bool(missing)):
         row = build_row(job, client, site, pm, hours, notes, folder)
         try:
-            tab, at, used = add_request(day, row)
+            tab, at, used = add_request(day, row, urgent)
         except Exception as e:
             st.error(str(e))
             return
@@ -570,7 +583,7 @@ def _new_request():
             n_today = 0
         rec = {"Ref": f"REQ-{now:%y%m%d}-{n_today + 1:02d}", "Submitted": f"{now:%d/%m/%Y %H:%M}", "Job No": job, "Client": client.strip(),
                "Site": site.strip(), "Requested by": pm.strip().upper(), "Hours": f"{hours:g}" if hours else "",
-               "Required by": f"{need:%d/%m/%Y}" if need else "", "On schedule": f"{used:%d/%m/%Y}", "Came by": how,
+               "Required by": f"{need:%d/%m/%Y}" if need else "", "On schedule": f"{used:%d/%m/%Y}", "Urgent": "URGENT" if urgent else "",
                "What's needed": details.strip(), "Clarity folder": folder, "Schedule tab": tab, "Schedule row": at}
         try:
             log_request(rec)
@@ -679,7 +692,7 @@ TOOL_HOWTO = {
         "Type the Clarity job number. If it's been on the schedule before, the client, site and PM fill themselves in.",
         "Add the estimated hours, the date you need it by and what's needed, then press Submit request.",
         "It goes into this month's tab under the date you pick (today unless you change it), at the bottom of that day, "
-        "with Drw. by left blank and a link to the Clarity folder in the Folder column.",
+        "with Drw. by left blank. Tick URGENT and the whole line goes in red.",
         "No job number yet? Leave it blank and fill in the site instead.",
     ],
     "Unallocated Jobs": [
