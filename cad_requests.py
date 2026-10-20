@@ -576,7 +576,7 @@ def _new_request():
     day = b3.date_input("Put it on the schedule under", value=today, key="nr_day", format="DD/MM/YYYY")
     details = st.text_area("What's needed", key="nr_details", height=90,
                            placeholder="e.g. Amend wayfinding package in line with client comments received today")
-    urgent = st.toggle("URGENT - puts the whole line on the schedule in red", key="nr_urgent")
+    urgent = st.toggle(":red[**URGENT**]", key="nr_urgent")
     folder = folder_path(job, client) if job and client else ""
     if folder:
         st.caption(f"Clarity folder: `{folder}`")
