@@ -67,6 +67,11 @@ CLARITY_ROOT = _secret("clarity_root", r"Z:\Clarity Job Documents")
 CAD_TEAM = list(_secret("cad_team", ["DJ", "DM", "JA"]))
 # Where a client's Clarity folder isn't named the same as on the schedule, e.g. {"Five Guys JV" = "Five Guys"}
 CLIENT_FOLDERS = dict(_secret("client_folders", {}))
+DAY_HOURS = float(_secret("day_hours", 8))
+# Fill colour for each CAD tech's lines on the schedule
+TECH_COLOURS = {k.upper(): v for k, v in dict(_secret("cad_colours", {"DJ": "#E3E3E3", "DM": "#DDEBF7", "JA": "#FCE4EC"})).items()}
+# Names used on the schedule for holidays, e.g. "JAY HOLIDAY" -> JA has no drawing time that day
+CAD_NAMES = {k.upper(): [n.upper() for n in v] for k, v in dict(_secret("cad_names", {"DJ": ["DEAN"], "DM": ["DAN"], "JA": ["JAY"]})).items()}
 
 # Schedule columns (A..J): count, job no., client, site, req. by, time, Drw. by, Notes, Drw. No., Folder
 C_JOB, C_CLIENT, C_SITE, C_PM, C_TIME, C_DRAWN, C_NOTES, C_DWG, C_FOLDER = 1, 2, 3, 4, 5, 6, 7, 8, 9
@@ -360,9 +365,219 @@ def add_request(d, row, urgent=False):
             pass
     try:                                     # URGENT = whole line in red; otherwise make sure it isn't red from the line above
         w.format(f"A{at}:I{at}", {"textFormat": {"foregroundColor": RED if urgent else BLACK, "bold": bool(urgent)}})
+        colour_rows(w, {at: row[C_DRAWN]})
     except Exception:
         pass
+    fix_day_total(w, day)
     return w.title, at, day
+
+
+# --------------------------------------------------------------------------------------
+# CAD time: day totals, 8 hours per tech per day, tech colours
+# --------------------------------------------------------------------------------------
+def _hex(h):
+    h = h.lstrip("#")
+    return {"red": int(h[0:2], 16) / 255, "green": int(h[2:4], 16) / 255, "blue": int(h[4:6], 16) / 255}
+
+
+def hours_of(x):
+    try:
+        return float(str(x).strip() or 0)
+    except ValueError:
+        return 0.0
+
+
+def day_blocks(values, month):
+    """[(day, heading_index, end_index)] for every date heading in a month tab (0-based, end exclusive)."""
+    heads = [(i, head_day(r, month)) for i, r in enumerate(values)]
+    heads = [(i, d) for i, d in heads if d]
+    return [(d, i, heads[k + 1][0] if k + 1 < len(heads) else len(values)) for k, (i, d) in enumerate(heads)]
+
+
+def tech_load(tabs):
+    """tabs = {title: values} -> (booked {(day, tech): hours}, off {(day, tech)}, working days)."""
+    booked, off, days = {}, set(), []
+    for title, values in tabs.items():
+        month = tab_month(title)
+        if not month:
+            continue
+        for d, h, e in day_blocks(values, month):
+            days.append(d)
+            for i in range(h + 1, e):
+                r = pad(values[i])
+                text = " ".join(r[1:C_DWG + 1]).upper()
+                if "HOLIDAY" in text:
+                    for t in CAD_TEAM:
+                        if any(n in text for n in CAD_NAMES.get(t, [])):
+                            off.add((d, t))
+                t = r[C_DRAWN].strip().upper()
+                if t and is_job_row(r):
+                    booked[(d, t)] = booked.get((d, t), 0.0) + hours_of(r[C_TIME])
+    return booked, off, sorted(set(days))
+
+
+def free_hours(booked, off, d, t):
+    return 0.0 if (d, t) in off else max(0.0, DAY_HOURS - booked.get((d, t), 0.0))
+
+
+def next_slot(booked, off, days, t, hrs, after):
+    """First working day on/after 'after' where tech t has room for hrs (any room at all if hrs is 0)."""
+    for d in days:
+        if d >= after:
+            f = free_hours(booked, off, d, t)
+            if (hrs and f >= hrs) or (not hrs and f > 0):
+                return d, f
+    return None, 0.0
+
+
+def colour_rows(w, rows):
+    """rows = {row: tech or ''} -> fill the boxes (B-I) in that tech's colour (white if nobody)."""
+    reqs = []
+    for r, t in rows.items():
+        col = TECH_COLOURS.get(str(t).strip().upper(), "#FFFFFF")
+        reqs.append({"repeatCell": {"range": {"sheetId": w.id, "startRowIndex": r - 1, "endRowIndex": r, "startColumnIndex": 1,
+                                              "endColumnIndex": C_DWG + 1},
+                                    "cell": {"userEnteredFormat": {"backgroundColor": _hex(col)}},
+                                    "fields": "userEnteredFormat.backgroundColor"}})
+    for k in range(0, len(reqs), 400):
+        w.spreadsheet.batch_update({"requests": reqs[k:k + 400]})
+
+
+def colour_tab(w):
+    """Colour every job line on a month tab by who's drawing it."""
+    values = w.get_all_values()
+    rows = {i + 1: pad(r)[C_DRAWN].strip().upper() for i, r in enumerate(values) if is_job_row(r)}
+    colour_rows(w, rows)
+    return sum(1 for t in rows.values() if t in TECH_COLOURS)
+
+
+def fix_day_total(w, d):
+    """Hours total box under a day = SUM of that day's boxed lines."""
+    try:
+        values = w.get_all_values()
+        boxed = boxed_rows(w, len(values))
+        blk = next(((h, e) for dd, h, e in day_blocks(values, d.replace(day=1)) if dd == d), None)
+        if not blk:
+            return
+        h, e = blk
+        jobs = [i for i in range(h + 1, e) if (i + 1) in boxed or is_job_row(values[i])]
+        if not jobs:
+            return
+        last = max(jobs)
+        t = last + 1
+        if t >= e or head_day(values[t], d.replace(day=1)) or is_job_row(values[t]):
+            return
+        if t == e - 1 and not pad(values[t])[C_TIME].strip() and e < len(values):
+            return                               # don't use up the last blank line before the next day
+        w.update(range_name=f"F{t + 1}", values=[[f"=SUM(F{jobs[0] + 1}:F{last + 1})"]], value_input_option="USER_ENTERED")
+        side = {"style": "SOLID", "width": 1}
+        w.format(f"F{t + 1}", {"borders": {"top": side, "bottom": side, "left": side, "right": side}})
+    except Exception:
+        pass
+
+
+def month_tabs(around):
+    """Values of last month's, this month's and next month's tabs (where they exist)."""
+    out = {}
+    m = around.replace(day=1)
+    for d in ((m - dt.timedelta(days=1)).replace(day=1), m, (m + dt.timedelta(days=32)).replace(day=1)):
+        w = ws(tab_name(d))
+        if w is not None:
+            out[w.title] = w.get_all_values()
+    return out
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_snapshot(today):
+    return tech_load(month_tabs(today))
+
+
+def move_job(tab, row, job, site, notes, tech, day):
+    """Take an unallocated line off its day and put it under 'day', given to tech."""
+    w = ws(tab)
+    values = w.get_all_values()
+    t = find_row(values, row, job, site)
+    if t is None:
+        return False
+    line = pad(values[t - 1])[:C_DWG + 1]
+    urgent = any(r.get("Urgent") and r.get("Job No", "").strip() == job and r.get("Site", "").strip() == site
+                 for r in saved_requests())
+    delete_jobs([(tab, t, job, site, notes)], log=False)
+    line[C_DRAWN] = tech
+    add_request(day, line, urgent)
+    return True
+
+
+def find_row(values, row, job, site):
+    """Row (1-based) of an unallocated job line - where it was, or found again if lines have moved."""
+    r = pad(values[row - 1]) if 0 < row <= len(values) else pad([])
+    if r[C_JOB].strip() == job and r[C_SITE].strip() == site and not r[C_DRAWN].strip():
+        return row
+    return next((i + 1 for i, x in enumerate(values) if pad(x)[C_JOB].strip() == job
+                 and pad(x)[C_SITE].strip() == site and not pad(x)[C_DRAWN].strip()), None)
+
+
+def delete_jobs(items, log=True):
+    """items = [(tab, row, job, site, notes)] -> takes the lines off the schedule. If it's the only line under its date
+    the box is emptied (so the day keeps its box); otherwise the line is removed and the day's hours total shrinks."""
+    done, skipped = [], []
+    by_tab = {}
+    for it in items:
+        by_tab.setdefault(it[0], []).append(it)
+    for tab, its in by_tab.items():
+        w = ws(tab)
+        values = w.get_all_values()
+        month = tab_month(tab)
+        found = []
+        for _, row, job, site, notes in its:
+            t = find_row(values, row, job, site)
+            if t is None or t in [f[0] for f in found]:
+                skipped.append(f"{job} {site}")
+                continue
+            found.append((t, job, site, notes))
+        for t, job, site, notes in sorted(found, reverse=True):       # bottom up, so row numbers above stay right
+            values = w.get_all_values()
+            h = next((i for i in range(t - 2, -1, -1) if head_day(values[i], month)), None)
+            end = next((i for i in range(t, len(values)) if head_day(values[i], month)), len(values))
+            others = [i for i in range((h if h is not None else -1) + 1, end) if i != t - 1 and is_job_row(values[i])]
+            if others:
+                w.delete_rows(t)
+            else:
+                w.update(range_name=f"A{t}:I{t}", values=[[""] * (C_DWG + 1)])
+                try:
+                    w.format(f"A{t}:I{t}", {"textFormat": {"foregroundColor": BLACK, "bold": False}})
+                    colour_rows(w, {t: ""})
+                except Exception:
+                    pass
+            done.append(f"{job} {site}".strip())
+            if log:
+                mark_log_deleted(job, site, notes)
+    return done, skipped
+
+
+def mark_log_deleted(job, site, notes):
+    """Keep the request in Saved Requests, marked as deleted from the schedule."""
+    try:
+        w = ws(LOG_TAB)
+        if w is None:
+            return
+        v = w.get_all_values()
+        head = list(v[0])
+        if "Deleted" not in head:
+            head.append("Deleted")
+            w.update(range_name="A1", values=[head])
+        col = head.index("Deleted")
+        ix = {k: head.index(k) for k in ("Job No", "Site", "What's needed") if k in head}
+        for i in range(len(v) - 1, 0, -1):
+            r = pad(v[i], len(head))
+            if r[ix.get("Job No", 0)].strip() == job and r[ix.get("Site", 0)].strip() == site \
+                    and r[ix.get("What's needed", 0)].strip() == notes and not r[col].strip():
+                a1 = chr(65 + col) if col < 26 else "A" + chr(65 + col - 26)
+                w.update(range_name=f"{a1}{i + 1}", values=[[f"{uk_now():%d/%m/%Y %H:%M}"]])
+                break
+        saved_requests.clear()
+    except Exception:
+        pass
 
 
 def allocate(items):
@@ -385,6 +600,10 @@ def allocate(items):
                 skipped.append(f"{job} {site}")
                 continue
             w.update(range_name=f"G{target}", values=[[tech]])
+            try:
+                colour_rows(w, {target: tech})
+            except Exception:
+                pass
             values[target - 1] = pad(values[target - 1])
             values[target - 1][C_DRAWN] = tech
             done.append(f"{job} {site} -> {tech}")
@@ -397,7 +616,7 @@ def allocate(items):
 # --------------------------------------------------------------------------------------
 LOG_TAB = "Requests Log"
 LOG_COLS = ["Ref", "Submitted", "Job No", "Client", "Site", "Requested by", "Hours", "Required by", "On schedule",
-            "Urgent", "What's needed", "Clarity folder", "Schedule tab", "Schedule row"]
+            "Urgent", "What's needed", "Clarity folder", "Schedule tab", "Schedule row", "Drawn by"]
 
 
 def uk_now():
@@ -441,6 +660,8 @@ def saved_requests():
 
 def request_status(rec, hist):
     """Who the request went to, from the schedule (the row under that date with the same job / site)."""
+    if str(rec.get("Deleted", "")).strip():
+        return f"Deleted {rec['Deleted'][:10]}"
     job, site = rec.get("Job No", "").strip(), rec.get("Site", "").strip()
     try:
         day = dt.datetime.strptime(rec.get("On schedule", ""), "%d/%m/%Y").date()
@@ -613,7 +834,7 @@ def new_request():
             if done.get("Urgent"):
                 st.error("URGENT - it's in red on the schedule.")
             st.success(f"Request {done['Ref']} sent - it's on the cad schedule ('{done['Schedule tab']}', under "
-                       f"{done['On schedule'][:5].replace('/', '-')}) with Drw. by blank, and saved in Saved Requests.")
+                       f"{done['On schedule'][:5].replace('/', '-')}){' given to ' + done['Drawn by'] if done.get('Drawn by') else ' with Drw. by blank'}, and saved in Saved Requests.")
             needed = done.get("What's needed", "")
             st.markdown(f"**{done['Job No']} {done['Client']} - {done['Site']}**  \n{needed}")
             b1, b2, _ = st.columns([1, 1, 3])
@@ -648,6 +869,23 @@ def _new_request():
     day = b3.date_input("Put it on the schedule under", value=today, key="nr_day", format="DD/MM/YYYY")
     details = st.text_area("What's needed", key="nr_details", height=90,
                            placeholder="e.g. Amend wayfinding package in line with client comments received today")
+    try:
+        booked, off, days = load_snapshot(today)
+    except Exception:
+        booked, off, days = {}, set(), []
+    caps = ["Leave it for the CAD team to sort"] + [
+        "Off that day" if (day, t) in off else f"{free_hours(booked, off, day, t):g}h free on {day:%a %d-%b}" for t in CAD_TEAM]
+    who = st.radio("Who's drawing it?", ["Not decided"] + CAD_TEAM, horizontal=True, key="nr_who", captions=caps)
+    tech = "" if who == "Not decided" else who
+    if tech:
+        if (day, tech) in off or free_hours(booked, off, day, tech) < max(hours, 0.01):
+            nxt, f = next_slot(booked, off, days, tech, hours, day)
+            if nxt and nxt != day:
+                st.warning(f"{tech} hasn't got {hours:g}h free on {day:%a %d-%b}. Next free: **{nxt:%a %d-%b}** ({f:g}h free).")
+                if st.checkbox(f"Put it on {nxt:%a %d-%b} instead", value=True, key="nr_shift"):
+                    day = nxt
+            elif not nxt:
+                st.warning(f"{tech} is fully booked on every day on the schedule so far - it'll go on {day:%a %d-%b} anyway.")
     urgent = st.toggle(":red[**URGENT**]", key="nr_urgent")
     folder = folder_path(job, client) if job and client else ""
     if folder:
@@ -658,6 +896,7 @@ def _new_request():
     if st.button("Submit request", type="primary", key="nr_go", disabled=bool(missing) or st.session_state.get("nr_sending", False)):
         st.session_state["nr_sending"] = True
         row = build_row(job, client, site, pm, hours, notes, folder)
+        row[C_DRAWN] = tech
         try:
             tab, at, used = add_request(day, row, urgent)
         except DuplicateRequest as e:
@@ -669,6 +908,7 @@ def _new_request():
             st.error(str(e))
             return
         all_history.clear()
+        load_snapshot.clear()
         now = uk_now()
         try:
             n_today = sum(1 for r in saved_requests() if str(r.get("Ref", "")).startswith(f"REQ-{now:%y%m%d}"))
@@ -677,7 +917,7 @@ def _new_request():
         rec = {"Ref": f"REQ-{now:%y%m%d}-{n_today + 1:02d}", "Submitted": f"{now:%d/%m/%Y %H:%M}", "Job No": job, "Client": client.strip(),
                "Site": site.strip(), "Requested by": pm.strip().upper(), "Hours": f"{hours:g}" if hours else "",
                "Required by": f"{need:%d/%m/%Y}" if need else "", "On schedule": f"{used:%d/%m/%Y}", "Urgent": "URGENT" if urgent else "",
-               "What's needed": details.strip(), "Clarity folder": folder, "Schedule tab": tab, "Schedule row": at}
+               "What's needed": details.strip(), "Clarity folder": folder, "Drawn by": tech, "Schedule tab": tab, "Schedule row": at}
         try:
             log_request(rec)
         except Exception as e:
@@ -688,35 +928,131 @@ def _new_request():
         st.caption("Still needed: " + ", ".join(missing))
 
 
+def availability_table(booked, off, days, start, n=10):
+    rows = []
+    for d in [x for x in days if x >= start][:n]:
+        row = {"Day": f"{d:%a %d-%b}"}
+        for t in CAD_TEAM:
+            row[t] = "Off" if (d, t) in off else f"{booked.get((d, t), 0):g} / {DAY_HOURS:g}"
+        rows.append(row)
+    df = pd.DataFrame(rows)
+
+    def shade(v):
+        if v == "Off":
+            return "background-color: #eeeeee; color: #888"
+        try:
+            b = float(str(v).split("/")[0])
+        except ValueError:
+            return ""
+        return ("background-color: #fde2e1" if b > DAY_HOURS else "background-color: #fff4ce" if b >= DAY_HOURS
+                else "background-color: #e6f4ea" if b == 0 else "")
+    return df.style.map(shade, subset=CAD_TEAM) if not df.empty else df
+
+
 def unallocated():
     today = dt.date.today()
-    prev_month = (today.replace(day=1) - dt.timedelta(days=1))
+    tabs = month_tabs(today)
+    booked, off, days = tech_load(tabs)
     rows = []
-    for t in (tab_name(prev_month), tab_name(today)):
-        w = ws(t)
-        if w is not None:
-            rows += unallocated_from(w.title, w.get_all_values())
-    if st.button("Refresh", key="ua_ref"):
+    prev_t, cur_t = tab_name((today.replace(day=1) - dt.timedelta(days=1))), tab_name(today)
+    for t, v in tabs.items():
+        if t.lower() in (prev_t.lower(), cur_t.lower()):
+            rows += unallocated_from(t, v)
+    c1, c2 = st.columns([3, 1])
+    if c2.button("Refresh", key="ua_ref", use_container_width=True):
         st.rerun()
+    with st.expander(f"CAD time - booked / {DAY_HOURS:g} hours a day", expanded=True):
+        st.dataframe(availability_table(booked, off, days, today), hide_index=True, use_container_width=True)
+        st.caption("Green = nothing booked, amber = full, red = over. 'Off' = holiday on the schedule. "
+                   "Lines with no hours don't count towards the 8.")
     if not rows:
         st.success("Nothing waiting - every job on this month's and last month's schedule has a CAD tech.")
         return
     df = pd.DataFrame(rows)
-    df["Date"] = df["Date"].apply(lambda d: f"{d:%a %d-%b}" if d else "")
+    df["Day"] = df["Date"].apply(lambda d: f"{d:%a %d-%b}" if d else "")
     df.insert(0, "Give to", None)
-    st.metric("Jobs waiting for a CAD tech", len(df))
-    ed = st.data_editor(df, hide_index=True, use_container_width=True, key="ua_ed",
+    df.insert(1, "Delete", False)
+    c1.metric("Jobs waiting for a CAD tech", len(df))
+    ed = st.data_editor(df.drop(columns=["Date"]), hide_index=True, use_container_width=True, key="ua_ed",
                         column_config={"Give to": st.column_config.SelectboxColumn("Give to", options=CAD_TEAM, width="small"),
+                                       "Delete": st.column_config.CheckboxColumn("Delete", width="small",
+                                                                                 help="Take this line off the schedule"),
                                        "Tab": None, "Row": None},
-                        disabled=[c for c in df.columns if c != "Give to"])
-    picks = ed[ed["Give to"].notna()]
-    if st.button(f"Save ({len(picks)})", type="primary", disabled=picks.empty, key="ua_save"):
-        done, skipped = allocate([(r["Tab"], int(r["Row"]), r["Job"], r["Site"], r["Give to"]) for _, r in picks.iterrows()])
+                        disabled=[c for c in df.columns if c not in ("Give to", "Delete")])
+    ed["Date"] = df["Date"]
+    dels = ed[ed["Delete"] == True]                                    # noqa: E712
+    picks = ed[ed["Give to"].notna() & (ed["Delete"] != True)]         # noqa: E712
+
+    # 8 hours a day: check each pick (in order) against what's booked, suggest the next free day if it doesn't fit
+    plan, sim = [], dict(booked)
+    for idx, r in picks.iterrows():
+        t, hrs, d = r["Give to"], hours_of(r["Hrs"]), r["Date"] or today
+        d = max(d, today) if d < today else d
+        fits = (d, t) not in off and sim.get((d, t), 0.0) + hrs <= DAY_HOURS
+        target = d
+        if not fits:
+            target, _ = next_slot(sim, off, days, t, hrs, d)
+        dd = target or d
+        sim[(dd, t)] = sim.get((dd, t), 0.0) + hrs
+        plan.append({"idx": idx, "fits": fits, "to": target})
+    moving = [p for p in plan if not p["fits"]]
+    move_ok = True
+    if picks.shape[0]:
+        chk = []
+        for p in plan:
+            r = picks.loc[p["idx"]]
+            d = r["Date"] or today
+            if p["fits"]:
+                res = f"Fits - {free_hours(booked, off, d, r['Give to']):g}h free that day"
+            elif p["to"]:
+                res = f"Over {DAY_HOURS:g}h on {d:%a %d-%b} -> next free: {p['to']:%a %d-%b}"
+            else:
+                res = "Over - no free day found on the schedule yet"
+            chk.append({"Job": r["Job"], "Site": r["Site"], "Hrs": r["Hrs"], "Give to": r["Give to"], "Day": r["Day"], "Check": res})
+        st.dataframe(pd.DataFrame(chk), hide_index=True, use_container_width=True)
+        if moving:
+            move_ok = st.checkbox("Move the ones that don't fit to their next free day (recommended)", value=True, key="ua_move")
+    if not dels.empty:
+        st.warning(f"{len(dels)} line(s) will be taken off the schedule: "
+                   + "; ".join(f"{r['Job']} {r['Client']} - {r['Site']} ({r['Day']})" for _, r in dels.iterrows()))
+        sure = st.checkbox("Yes, delete them", key="ua_sure")
+    else:
+        sure = False
+    n = len(picks) + (len(dels) if sure else 0)
+    if st.button(f"Save ({n})", type="primary", disabled=n == 0, key="ua_save"):
+        msgs, skipped = [], []
+        stay = [p for p in plan if p["fits"] or not move_ok or not p["to"]]
+        go = [p for p in plan if not (p["fits"] or not move_ok or not p["to"])]
+        done, sk = allocate([(picks.loc[p["idx"], "Tab"], int(picks.loc[p["idx"], "Row"]), picks.loc[p["idx"], "Job"],
+                              picks.loc[p["idx"], "Site"], picks.loc[p["idx"], "Give to"]) for p in stay])
+        msgs += done
+        skipped += sk
+        for p in go:
+            r = picks.loc[p["idx"]]
+            if move_job(r["Tab"], int(r["Row"]), r["Job"], r["Site"], r["Notes"], r["Give to"], p["to"]):
+                msgs.append(f"{r['Job']} {r['Site']} -> {r['Give to']} on {p['to']:%a %d-%b}")
+            else:
+                skipped.append(f"{r['Job']} {r['Site']}")
+        gone = []
+        if sure and not dels.empty:
+            gone, sk2 = delete_jobs([(r["Tab"], int(r["Row"]), r["Job"], r["Site"], r["Notes"]) for _, r in dels.iterrows()])
+            skipped += sk2
         all_history.clear()
-        if done:
-            st.success("Saved: " + "; ".join(done))
+        load_snapshot.clear()
+        if msgs:
+            st.success("Given out: " + "; ".join(msgs))
+        if gone:
+            st.success("Deleted: " + "; ".join(gone))
         if skipped:
-            st.warning("Couldn't find these any more (moved or already given out): " + "; ".join(skipped))
+            st.warning("Couldn't find these any more (moved, given out or already deleted): " + "; ".join(skipped))
+        if msgs or gone:
+            st.session_state.pop("ua_sure", None)
+            st.button("OK - refresh the list", key="ua_ok")
+    st.divider()
+    if st.button("Colour this month's schedule by CAD tech", key="ua_colour"):
+        w = ws(cur_t)
+        n = colour_tab(w) if w is not None else 0
+        st.success(f"Coloured {n} lines on '{cur_t}': " + ", ".join(f"{t} {c}" for t, c in TECH_COLOURS.items()))
 
 
 def find_job():
@@ -784,6 +1120,8 @@ TOOL_HOWTO = {
     "New Request": [
         "Type the Clarity job number. If it's been on the schedule before, the client, site and PM fill themselves in.",
         "Add the estimated hours, the date you need it by and what's needed, then press Submit request.",
+        "Pick who's drawing it (DJ / DM / JA) if you know - each shows their free hours that day out of 8. If they're full, it "
+        "offers their next free day. Leave it on 'Not decided' and it goes on Unallocated Jobs for the CAD team.",
         "It goes into this month's tab under the date you pick (today unless you change it), at the bottom of that day, "
         "with Drw. by left blank. Tick URGENT and the whole line goes in red.",
         "No job number yet? Leave it blank and fill in the site instead.",
@@ -791,6 +1129,13 @@ TOOL_HOWTO = {
     "Unallocated Jobs": [
         "Lists every line on this month's and last month's tabs with a PM but no Drw. by.",
         "Pick a name in the 'Give to' column for as many as you like, then press Save - it writes their initials into Drw. by.",
+        "The CAD time table shows each tech's booked hours per day out of 8 (holidays like 'JAY HOLIDAY' count as off).",
+        "When you give a job out, it checks the tech still has room that day. If not, it shows the next day they're free and "
+        "(ticked by default) moves the line to that day when you Save.",
+        "Lines are filled in each tech's colour (DJ grey, DM blue, JA pink). 'Colour this month's schedule' does the whole tab "
+        "in one go for lines given out by hand.",
+        "Tick 'Delete' to take a line off the schedule (it asks you to confirm). If it's the only job under that date, the box is "
+        "just emptied so the day keeps its layout. The request stays in Saved Requests, marked as deleted.",
         "If someone's added lines since you opened the page, it finds the job again before writing, so nothing lands on the wrong row.",
     ],
     "Saved Requests": [
