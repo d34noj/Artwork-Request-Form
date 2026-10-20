@@ -17,7 +17,40 @@ import urllib.parse
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="CAD Requests", layout="wide")
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOGO = os.path.join(HERE, "geetee_logo.png")
+BRAND = "#D60C4D"                                  # GeeTee red, taken from the logo
+
+st.set_page_config(page_title="CAD Requests | GeeTee", page_icon=LOGO if os.path.exists(LOGO) else None, layout="wide")
+
+
+def page_style():
+    """GeeTee header bar and brand colours."""
+    import base64
+    logo = ""
+    if os.path.exists(LOGO):
+        logo = base64.b64encode(open(LOGO, "rb").read()).decode()
+    st.markdown(f"""
+<style>
+  #MainMenu, footer, [data-testid="stToolbar"], [data-testid="stHeader"], [data-testid="stDecoration"] {{ display: none; }}
+  .block-container {{ padding-top: 1.6rem; max-width: 1250px; }}
+  .gt-head {{ display: flex; align-items: center; gap: 22px; padding: 14px 4px 16px; border-bottom: 3px solid {BRAND};
+              margin-bottom: 18px; }}
+  .gt-head img {{ height: 64px; width: auto; }}
+  .gt-head h1 {{ font-size: 1.85rem; font-weight: 700; margin: 0; padding: 0; letter-spacing: -0.01em; line-height: 1.15; }}
+  .gt-head p {{ margin: 3px 0 0; opacity: .65; font-size: .95rem; }}
+  .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {{
+      background: {BRAND}; border-color: {BRAND}; color: #fff; font-weight: 600; }}
+  .stButton > button[kind="primary"]:hover {{ background: #b80a42; border-color: #b80a42; color: #fff; }}
+  .stButton > button[kind="primary"]:disabled {{ background: #e9a3ba; border-color: #e9a3ba; }}
+  [data-testid="stMetricValue"] {{ color: {BRAND}; font-weight: 700; }}
+  [role="radiogroup"] label p {{ font-weight: 600; }}
+  [data-testid="stCaptionContainer"] {{ opacity: .8; }}
+</style>
+<div class="gt-head">
+  {f'<img src="data:image/png;base64,{logo}" alt="GeeTee">' if logo else ''}
+  <div><h1>CAD Requests</h1><p>Artwork requests straight onto the cad schedule</p></div>
+</div>""", unsafe_allow_html=True)
 
 # --------------------------------------------------------------------------------------
 # Settings
@@ -276,6 +309,11 @@ def find_local_folder(job, client):
 
 
 def new_request():
+    with st.container(border=True):
+        _new_request()
+
+
+def _new_request():
     today = dt.date.today()
     c0, c1 = st.columns([1, 3])
     job = c0.text_input("Clarity job no.", key="nr_job", placeholder="e.g. 14973").strip()
@@ -386,17 +424,17 @@ def find_job():
 # --------------------------------------------------------------------------------------
 pw = _secret("app_password")
 if pw and st.session_state.get("ok") != pw:
-    st.title("CAD Requests")
+    page_style()
     if st.text_input("Password", type="password") == pw:
         st.session_state["ok"] = pw
         st.rerun()
     st.stop()
 
-st.title("CAD Requests")
+page_style()
 TOOL_HELP = {
-    "New Request": "PMs: ask the CAD team for artwork. It goes straight onto the cad schedule under today's date.",
-    "Unallocated Jobs": "Everything on the schedule with no CAD tech yet - pick who gets it and save.",
-    "Find a Job": "Every time a job's been on the schedule, who drew it, hours logged, and its Clarity folder.",
+    "New Request": "Ask the CAD team for artwork",
+    "Unallocated Jobs": "Give waiting jobs to a CAD tech",
+    "Find a Job": "Job history and Clarity folder",
 }
 TOOL_HOWTO = {
     "New Request": [
