@@ -78,6 +78,13 @@ TAB_FORMATS = ("%B %Y", "%b %Y", "%B %y", "%b %y")
 # --------------------------------------------------------------------------------------
 # Pure helpers (no Google calls) - these are what the tests run against
 # --------------------------------------------------------------------------------------
+def job_no(t):
+    """'C14973', 'c 14973', 'C-14973' -> '14973' (Clarity puts a C in front; the schedule doesn't)."""
+    t = str(t or "").strip()
+    m = re.fullmatch(r"[Cc]\s*-?\s*(\d{3,7})", t)
+    return m.group(1) if m else t
+
+
 def tab_name(d):
     return f"{d:%B %Y}"
 
@@ -209,7 +216,20 @@ def book():
     import gspread
     import json
     raw = _secret("gcp_json")                    # easiest: the whole downloaded .json pasted in Secrets as gcp_json
-    creds = json.loads(raw) if raw else _secret("gcp_service_account")
+    creds = None
+    if raw:
+        raw = str(raw).strip().lstrip("\ufeff")
+        i, j = raw.find("{"), raw.rfind("}")
+        if i < 0 or j < i:
+            raise RuntimeError("gcp_json in Secrets hasn't got the key file in it - it should start with {  and end with }. "
+                               "Open the downloaded .json in Notepad, Ctrl+A, Ctrl+C, and paste it between the three-quote marks.")
+        try:
+            creds = json.loads(raw[i:j + 1])
+        except ValueError as e:
+            raise RuntimeError(f"The key pasted in gcp_json isn't complete ({e}). Paste the whole .json again - all of it, "
+                               "from the first {  to the last }.")
+    else:
+        creds = _secret("gcp_service_account")
     if not creds:
         raise RuntimeError("No Google key set up yet - see SETUP.txt (gcp_json in the app's Secrets).")
     creds = dict(creds)
@@ -294,6 +314,138 @@ def allocate(items):
 
 
 # --------------------------------------------------------------------------------------
+# Saved requests: every request is also kept on a 'Requests Log' tab (the schedule rows get edited and moved,
+# the log never changes), and any of them can be downloaded as a one-page request sheet.
+# --------------------------------------------------------------------------------------
+LOG_TAB = "Requests Log"
+LOG_COLS = ["Ref", "Submitted", "Job No", "Client", "Site", "Requested by", "Hours", "Required by", "On schedule",
+            "Came by", "What's needed", "Clarity folder", "Schedule tab", "Schedule row"]
+
+
+def uk_now():
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo("Europe/London"))
+    except Exception:
+        return dt.datetime.now()
+
+
+def log_ws():
+    w = ws(LOG_TAB)
+    if w is None:
+        w = book().add_worksheet(title=LOG_TAB, rows=1000, cols=len(LOG_COLS))
+        w.update(range_name="A1", values=[LOG_COLS])
+    return w
+
+
+def log_request(rec):
+    log_ws().append_row([str(rec.get(c, "")) for c in LOG_COLS], value_input_option="RAW")
+    saved_requests.clear()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def saved_requests():
+    w = ws(LOG_TAB)
+    if w is None:
+        return []
+    v = w.get_all_values()
+    if not v:
+        return []
+    head = v[0]
+    return [dict(zip(head, pad(r, len(head)))) for r in v[1:] if any(str(x).strip() for x in r)]
+
+
+def request_status(rec, hist):
+    """Who the request went to, from the schedule (the row under that date with the same job / site)."""
+    job, site = rec.get("Job No", "").strip(), rec.get("Site", "").strip()
+    try:
+        day = dt.datetime.strptime(rec.get("On schedule", ""), "%d/%m/%Y").date()
+    except ValueError:
+        day = None
+    rows = [h for h in hist if (h["Job"] == job if job else h["Site"] == site) and (day is None or h["Date"] >= day)]
+    det = rec.get("What's needed", "").strip()[:40]
+    exact = [h for h in rows if det and det in h["Notes"]]       # the very line this request made
+    if exact:
+        rows = exact
+    drawn = [h["Drw. by"] for h in rows if h["Drw. by"]]
+    return f"Given to {drawn[0]}" if drawn else ("Waiting" if rows else "Not found on schedule")
+
+
+def request_pdf(rec):
+    """One A4 page per request - for the job file / printing."""
+    import io
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from xml.sax.saxutils import escape
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm,
+                            title=f"Artwork request {rec.get('Ref', '')}")
+    red = colors.HexColor(BRAND)
+    h = ParagraphStyle("h", fontName="Helvetica-Bold", fontSize=20, leading=24)
+    sub = ParagraphStyle("s", fontName="Helvetica", fontSize=10, leading=13, textColor=colors.HexColor("#666666"))
+    lab = ParagraphStyle("l", fontName="Helvetica-Bold", fontSize=9.5, leading=12, textColor=colors.HexColor("#444444"))
+    val = ParagraphStyle("v", fontName="Helvetica", fontSize=10.5, leading=14)
+    head_cells = [[Paragraph("Artwork Request", h), ""],
+                  [Paragraph(f"{escape(rec.get('Ref', ''))} &nbsp;&middot;&nbsp; submitted {escape(rec.get('Submitted', ''))}", sub), ""]]
+    if os.path.exists(LOGO):
+        head_cells[0][1] = Image(LOGO, width=38 * mm, height=38 * mm * 343 / 690)
+    top = Table(head_cells, colWidths=[124 * mm, 50 * mm])
+    top.setStyle(TableStyle([("SPAN", (1, 0), (1, 1)), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (1, 0), (1, 1), "RIGHT"),
+                             ("LINEBELOW", (0, 1), (-1, 1), 2, red), ("BOTTOMPADDING", (0, 1), (-1, 1), 8)]))
+    fields = ["Job No", "Client", "Site", "Requested by", "Hours", "Required by", "On schedule", "Came by", "What's needed",
+              "Clarity folder"]
+    names = {"Job No": "Clarity job no.", "Site": "Site / project", "Hours": "Estimated CAD time (hours)",
+             "On schedule": "On the cad schedule under"}
+    data = [[Paragraph(names.get(f, f), lab), Paragraph(escape(rec.get(f, "") or "-").replace("\n", "<br/>"), val)] for f in fields]
+    t = Table(data, colWidths=[52 * mm, 122 * mm])
+    t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LINEBELOW", (0, 0), (-1, -1), 0.4, colors.HexColor("#dddddd")),
+                           ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
+    sign = Table([[Paragraph("CAD technician", lab), "", Paragraph("Date completed", lab), ""]],
+                 colWidths=[34 * mm, 54 * mm, 34 * mm, 52 * mm], rowHeights=[14 * mm])
+    sign.setStyle(TableStyle([("LINEBELOW", (1, 0), (1, 0), 0.6, colors.black), ("LINEBELOW", (3, 0), (3, 0), 0.6, colors.black),
+                              ("VALIGN", (0, 0), (-1, -1), "BOTTOM")]))
+    doc.build([top, Spacer(1, 8 * mm), t, Spacer(1, 14 * mm), sign])
+    return buf.getvalue()
+
+
+def saved_screen():
+    recs = saved_requests()
+    if not recs:
+        st.info("No requests saved yet. Every request made on New Request is kept here (and on the 'Requests Log' tab of the schedule).")
+        return
+    q = st.text_input("Search", key="sv_q", placeholder="Job no., client, site, initials...").strip().lower()
+    if q:
+        recs = [r for r in recs if any(q in str(v).lower() for v in r.values())]
+    recs = recs[::-1]
+    hist = all_history()
+    df = pd.DataFrame([{"Ref": r.get("Ref"), "Submitted": r.get("Submitted"), "Job No": r.get("Job No"), "Client": r.get("Client"),
+                        "Site": r.get("Site"), "By": r.get("Requested by"), "Hours": r.get("Hours"), "Required by": r.get("Required by"),
+                        "Status": request_status(r, hist), "What's needed": r.get("What's needed")} for r in recs])
+    st.caption(f"{len(df)} request(s), newest first.")
+    st.dataframe(df, hide_index=True, use_container_width=True)
+    if not recs:
+        return
+    pick = st.selectbox("Open a request", range(len(recs)), key="sv_pick",
+                        format_func=lambda i: f"{recs[i].get('Ref')}  -  {recs[i].get('Job No') or '-'}  {recs[i].get('Client')}  "
+                                              f"{recs[i].get('Site')}")
+    r = recs[pick]
+    with st.container(border=True):
+        c1, c2 = st.columns([3, 1])
+        c1.markdown(f"**{r.get('Job No') or ''} {r.get('Client')} - {r.get('Site')}**  \n"
+                    f"Requested by {r.get('Requested by')} on {r.get('Submitted')}  \n"
+                    f"Hours: {r.get('Hours') or '-'} · Required by: {r.get('Required by') or '-'} · {request_status(r, hist)}")
+        needed = r.get("What's needed", "")
+        c1.markdown(f"> {needed}")
+        if r.get("Clarity folder"):
+            c1.code(r["Clarity folder"], language=None)
+        c2.download_button("Download request sheet (PDF)", request_pdf(r), f"Artwork request {r.get('Ref')} {r.get('Job No')}.pdf",
+                           "application/pdf", type="primary", key="sv_pdf")
+
+
+# --------------------------------------------------------------------------------------
 # Screens
 # --------------------------------------------------------------------------------------
 def open_folder_button(path, key):
@@ -316,15 +468,68 @@ def find_local_folder(job, client):
     return hits[0] if hits else None
 
 
+def logo_party():
+    """GeeTee logos floating up the screen instead of balloons."""
+    import base64
+    import random
+    if not os.path.exists(LOGO):
+        st.balloons()
+        return
+    src = "data:image/png;base64," + base64.b64encode(open(LOGO, "rb").read()).decode()
+    rnd = random.Random()
+    imgs = "".join(
+        f'<img src="{src}" style="left:{rnd.uniform(0, 92):.1f}vw; width:{rnd.randint(70, 150)}px; '
+        f'animation-delay:{rnd.uniform(0, 1.6):.2f}s; animation-duration:{rnd.uniform(2.8, 4.4):.2f}s; '
+        f'--sway:{rnd.choice([-1, 1]) * rnd.randint(20, 70)}px; --spin:{rnd.randint(-18, 18)}deg;">'
+        for _ in range(26))
+    st.markdown(f"""
+<style>
+  .gt-party {{ position: fixed; inset: 0; pointer-events: none; z-index: 99999; overflow: hidden; }}
+  .gt-party img {{ position: absolute; bottom: -180px; opacity: 0; filter: drop-shadow(0 4px 6px rgba(0,0,0,.18));
+                   background: #fff; border-radius: 10px; animation-name: gtRise; animation-timing-function: ease-out;
+                   animation-fill-mode: forwards; }}
+  @keyframes gtRise {{
+    0%   {{ transform: translate(0, 0) rotate(0deg); opacity: 0; }}
+    10%  {{ opacity: 1; }}
+    50%  {{ transform: translate(var(--sway), -60vh) rotate(var(--spin)); opacity: 1; }}
+    100% {{ transform: translate(calc(var(--sway) * -0.5), -125vh) rotate(calc(var(--spin) * -1)); opacity: 0; }}
+  }}
+</style>
+<div class="gt-party">{imgs}</div>""", unsafe_allow_html=True)
+
+
+def clear_form():
+    for k in [k for k in st.session_state if k.startswith("nr_")]:
+        del st.session_state[k]
+
+
 def new_request():
+    done = st.session_state.get("nr_done")
+    if done:
+        with st.container(border=True):
+            if not st.session_state.get("nr_party"):
+                st.session_state["nr_party"] = True
+                logo_party()
+            st.success(f"Request {done['Ref']} sent - it's on the cad schedule ('{done['Schedule tab']}', under "
+                       f"{done['On schedule'][:5].replace('/', '-')}) with Drw. by blank, and saved in Saved Requests.")
+            needed = done.get("What's needed", "")
+            st.markdown(f"**{done['Job No']} {done['Client']} - {done['Site']}**  \n{needed}")
+            b1, b2, _ = st.columns([1, 1, 3])
+            if b1.button("New request", type="primary", key="nr_again", use_container_width=True):
+                clear_form()
+                st.rerun()
+            b2.download_button("Request sheet (PDF)", request_pdf(done), f"Artwork request {done['Ref']} {done['Job No']}.pdf",
+                               "application/pdf", key="nr_pdf", use_container_width=True)
+        return
     with st.container(border=True):
         _new_request()
+        st.button("Clear form", key="nr_clear", on_click=clear_form)
 
 
 def _new_request():
     today = dt.date.today()
     c0, c1 = st.columns([1, 3])
-    job = c0.text_input("Clarity job no.", key="nr_job", placeholder="e.g. 14973").strip()
+    job = job_no(c0.text_input("Clarity job no.", key="nr_job", placeholder="e.g. 14973 (or C14973)"))
     prev = latest_for(job) if re.fullmatch(r"\d{4,6}", job or "") else None
     if job and prev:
         c1.success(f"Last on the schedule {prev['Date']:%d/%m/%y}: {prev['Client']} - {prev['Site']} (PM {prev['PM']}, drawn by "
@@ -358,8 +563,21 @@ def _new_request():
             st.error(str(e))
             return
         all_history.clear()
-        st.success(f"Added to '{tab}' row {at}, under {used:%d-%b}. Drw. by is left blank - it'll show on Unallocated Jobs.")
-        st.balloons()
+        now = uk_now()
+        try:
+            n_today = sum(1 for r in saved_requests() if str(r.get("Ref", "")).startswith(f"REQ-{now:%y%m%d}"))
+        except Exception:
+            n_today = 0
+        rec = {"Ref": f"REQ-{now:%y%m%d}-{n_today + 1:02d}", "Submitted": f"{now:%d/%m/%Y %H:%M}", "Job No": job, "Client": client.strip(),
+               "Site": site.strip(), "Requested by": pm.strip().upper(), "Hours": f"{hours:g}" if hours else "",
+               "Required by": f"{need:%d/%m/%Y}" if need else "", "On schedule": f"{used:%d/%m/%Y}", "Came by": how,
+               "What's needed": details.strip(), "Clarity folder": folder, "Schedule tab": tab, "Schedule row": at}
+        try:
+            log_request(rec)
+        except Exception as e:
+            st.warning(f"It's on the schedule, but couldn't be saved to the Requests Log: {e}")
+        st.session_state["nr_done"] = rec
+        st.rerun()
     elif missing:
         st.caption("Still needed: " + ", ".join(missing))
 
@@ -397,6 +615,8 @@ def unallocated():
 
 def find_job():
     q = st.text_input("Job number, client or site", key="fj_q", placeholder="14973, Next, Braintree...").strip()
+    if re.fullmatch(r"[Cc]\s*-?\s*\d{4,6}", q):
+        q = job_no(q)
     if not q:
         st.info("Type a job number to see every time it's been on the schedule, who drew it, and its Clarity folder.")
         return
@@ -431,6 +651,9 @@ def find_job():
 # Page
 # --------------------------------------------------------------------------------------
 pw = str(_secret("app_password", "") or "").strip()
+_tok = __import__("hashlib").sha256(("cadreq:" + pw).encode()).hexdigest()[:16] if pw else ""
+if pw and st.query_params.get("k") == _tok:               # remembered in the page address - refresh doesn't log you out
+    st.session_state["ok"] = pw
 if pw and st.session_state.get("ok") != pw:
     page_style()
     with st.form("login"):
@@ -439,6 +662,7 @@ if pw and st.session_state.get("ok") != pw:
     if go:
         if typed.strip() == pw:
             st.session_state["ok"] = pw
+            st.query_params["k"] = _tok
             st.rerun()
         st.error("Wrong password - it's the app_password set in the app's Secrets.")
     st.stop()
@@ -448,6 +672,7 @@ TOOL_HELP = {
     "New Request": "Ask the CAD team for artwork",
     "Unallocated Jobs": "Give waiting jobs to a CAD tech",
     "Find a Job": "Job history and Clarity folder",
+    "Saved Requests": "Every request made, for reference",
 }
 TOOL_HOWTO = {
     "New Request": [
@@ -462,6 +687,12 @@ TOOL_HOWTO = {
         "Pick a name in the 'Give to' column for as many as you like, then press Save - it writes their initials into Drw. by.",
         "If someone's added lines since you opened the page, it finds the job again before writing, so nothing lands on the wrong row.",
     ],
+    "Saved Requests": [
+        "Every request made through New Request is kept here, newest first, with who it was given to from the schedule.",
+        "Search by job number, client, site or initials. Open one to see the full request and download it as a one-page PDF "
+        "request sheet (with the GeeTee logo) for the job file.",
+        "They're stored on a 'Requests Log' tab in the cad schedule, so nothing is lost when the app restarts. Don't edit that tab by hand.",
+    ],
     "Find a Job": [
         "Type a job number for its full history on the schedule, or a client / site name to search.",
         "The Clarity folder path is shown to copy into Explorer. Run the app on an office PC and you get an Open folder button.",
@@ -474,11 +705,29 @@ with st.expander(f"How to use: {tool}", expanded=False):
 try:
     book()
 except Exception as e:
-    st.error(f"Can't open the cad schedule: {e}")
+    msg, name = str(e).strip(), type(e).__name__
+    robot = ""
+    try:
+        import json as _j
+        raw = str(_secret("gcp_json") or "")
+        robot = _j.loads(raw[raw.find("{"):raw.rfind("}") + 1]).get("client_email", "")
+    except Exception:
+        pass
+    if name in ("PermissionError", "SpreadsheetNotFound") or "403" in msg or "404" in msg:
+        st.error("The key works, but Google won't let the app into the cad schedule. Open the cad schedule > Share, add "
+                 f"**{robot or 'the client_email from the .json file'}** as an **Editor**, untick Notify, press Share - "
+                 "then refresh this page.")
+    elif "has not been used" in msg or "is disabled" in msg or "SERVICE_DISABLED" in msg:
+        st.error("The Google Sheets API isn't switched on for the key's project. In console.cloud.google.com search "
+                 "'Google Sheets API' > Enable (and 'Google Drive API' > Enable), wait a minute, then refresh.")
+    else:
+        st.error(f"Can't open the cad schedule: {msg or name}")
     st.stop()
 if tool == "New Request":
     new_request()
 elif tool == "Unallocated Jobs":
     unallocated()
+elif tool == "Saved Requests":
+    saved_screen()
 else:
     find_job()
