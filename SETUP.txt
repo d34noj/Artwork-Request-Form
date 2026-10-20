@@ -1,0 +1,56 @@
+CAD REQUESTS - SETUP (about 15 minutes, once)
+=============================================
+
+The app needs a Google "robot" account that's allowed to edit the cad schedule.
+
+1. MAKE THE ROBOT ACCOUNT
+   - Go to https://console.cloud.google.com and sign in with the Google account that owns the cad schedule.
+   - Top bar: Select a project > New project > name it "CAD Requests" > Create.
+   - Search bar: "Google Sheets API" > Enable.
+   - Search bar: "Service accounts" > + Create service account > name "cad-requests" > Done.
+   - Click the new service account > Keys tab > Add key > Create new key > JSON > Create.
+     A .json file downloads. Keep it safe - it's the key to the sheet.
+
+2. LET IT EDIT THE SCHEDULE
+   - Open the .json file in Notepad and copy the "client_email" (ends in .iam.gserviceaccount.com).
+   - Open the cad schedule > Share > paste that email > Editor > untick "Notify" > Share.
+
+3. PUT THE APP ON GITHUB / STREAMLIT CLOUD (same as the signage tool)
+   - Add cad_requests.py to your GitHub repo (it can sit next to app.py). Add gspread and google-auth
+     to requirements.txt (the signage tool doesn't mind them).
+   - share.streamlit.io > Create app > same repo > Main file path: cad_requests.py > Deploy.
+   - App > Settings > Secrets > paste the block below, filled in from your .json file > Save.
+
+4. SECRETS (copy into the Secrets box; locally save as .streamlit\secrets.toml next to cad_requests.py)
+
+app_password = "pick-a-password"          # anyone with the link needs this; delete the line to switch it off
+sheet_id = "17yQp7muhaHA1LWMVrTfEpBiYvFyklW3VD115kUc5GfM"
+clarity_root = 'Z:\Clarity Job Documents'
+cad_team = ["DJ", "DM", "JA"]
+
+[client_folders]                           # only where the Clarity folder name differs from the schedule
+# "Five Guys JV" = "Five Guys"
+
+[gcp_service_account]                      # every line from the .json file, as  key = "value"
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+client_email = "cad-requests@....iam.gserviceaccount.com"
+client_id = "..."
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "..."
+
+5. RUNNING IT ON YOUR OWN PC (for the "Open folder" button)
+   - Put cad_requests.py, run_cad_requests.bat and .streamlit\secrets.toml in one folder.
+   - pip install streamlit gspread google-auth pandas   (once)
+   - Double-click run_cad_requests.bat.
+
+NOTES
+- New requests go into this month's tab, at the bottom of the chosen date, with Drw. by blank.
+  Weekends / missing dates go under the next date heading that week. The month tab and its date headings
+  must already exist (as you make them now).
+- The Folder column is a link to the Clarity folder. Browsers won't open Z: links on their own - copy the
+  path into Explorer, or ask IT about the "Local Explorer" browser extension to make them one-click.
