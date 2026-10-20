@@ -263,6 +263,10 @@ def latest_for(job):
     return hits[-1] if hits else None
 
 
+class DuplicateRequest(RuntimeError):
+    pass
+
+
 RED = {"red": 0.86, "green": 0.0, "blue": 0.0}
 BLACK = {"red": 0.0, "green": 0.0, "blue": 0.0}
 
@@ -282,10 +286,25 @@ def add_request(d, row, urgent=False):
             break
     if at is None:
         raise RuntimeError(f"Couldn't find the {d.day}-{d:%b} heading (or a later one that week) in '{w.title}'. Add the date to the tab first.")
+    for i, x in enumerate(values):           # same request already there, still unallocated -> don't add it twice
+        x = pad(x)
+        if (x[C_JOB].strip(), x[C_SITE].strip(), x[C_NOTES].strip()) == (row[C_JOB], row[C_SITE], row[C_NOTES]) \
+                and not x[C_DRAWN].strip() and (row[C_JOB] or row[C_SITE]):
+            raise DuplicateRequest(f"That request is already on '{w.title}' (row {i + 1}) and not given out yet - "
+                                   "it hasn't been added again.")
+    src = next((i + 1 for i in range(min(at, len(values)) - 2, 0, -1) if is_job_row(values[i])), None)
     if insert:
         w.insert_row(row, index=at, value_input_option="USER_ENTERED", inherit_from_before=True)
     else:
         w.update(range_name=f"A{at}:I{at}", values=[row], value_input_option="USER_ENTERED")
+    if src:                                  # same boxes / borders as the job line above it
+        if insert and src >= at:
+            src += 1
+        try:
+            g = lambda r: {"sheetId": w.id, "startRowIndex": r - 1, "endRowIndex": r, "startColumnIndex": 0, "endColumnIndex": C_DWG + 1}
+            w.spreadsheet.batch_update({"requests": [{"copyPaste": {"source": g(src), "destination": g(at), "pasteType": "PASTE_FORMAT"}}]})
+        except Exception:
+            pass
     try:                                     # URGENT = whole line in red; otherwise make sure it isn't red from the line above
         w.format(f"A{at}:I{at}", {"textFormat": {"foregroundColor": RED if urgent else BLACK, "bold": bool(urgent)}})
     except Exception:
@@ -583,11 +602,17 @@ def _new_request():
     notes = details.strip()
     missing = [n for n, v in (("job no. or site", job or site), ("client", client), ("your initials", pm), ("what's needed", details))
                if not str(v).strip()]
-    if st.button("Submit request", type="primary", key="nr_go", disabled=bool(missing)):
+    if st.button("Submit request", type="primary", key="nr_go", disabled=bool(missing) or st.session_state.get("nr_sending", False)):
+        st.session_state["nr_sending"] = True
         row = build_row(job, client, site, pm, hours, notes, folder)
         try:
             tab, at, used = add_request(day, row, urgent)
+        except DuplicateRequest as e:
+            st.session_state["nr_sending"] = False
+            st.warning(str(e))
+            return
         except Exception as e:
+            st.session_state["nr_sending"] = False
             st.error(str(e))
             return
         all_history.clear()
