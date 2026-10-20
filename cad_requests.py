@@ -866,7 +866,9 @@ def _new_request():
     b1, b2, b3 = st.columns(3)
     hours = b1.number_input("Estimated CAD time (hours)", 0.0, 200.0, 0.0, 0.5, key="nr_hrs")
     need = b2.date_input("Required by", value=None, min_value=today - dt.timedelta(days=7), key="nr_need", format="DD/MM/YYYY")
-    day = b3.date_input("Put it on the schedule under", value=today, key="nr_day", format="DD/MM/YYYY")
+    day = b3.date_input("Day to draw it", value=today, key="nr_day", format="DD/MM/YYYY",
+                        help="Which day on the cad schedule this goes under - the day the CAD team should work on it. "
+                             "Today unless you change it. 'Required by' is just the deadline.")
     details = st.text_area("What's needed", key="nr_details", height=90,
                            placeholder="e.g. Amend wayfinding package in line with client comments received today")
     try:
@@ -971,7 +973,8 @@ def unallocated():
     df = pd.DataFrame(rows)
     df["Day"] = df["Date"].apply(lambda d: f"{d:%a %d-%b}" if d else "")
     df.insert(0, "Give to", None)
-    df.insert(1, "Delete", False)
+    if is_admin():
+        df.insert(1, "Delete", False)
     c1.metric("Jobs waiting for a CAD tech", len(df))
     ed = st.data_editor(df.drop(columns=["Date"]), hide_index=True, use_container_width=True, key="ua_ed",
                         column_config={"Give to": st.column_config.SelectboxColumn("Give to", options=CAD_TEAM, width="small"),
@@ -980,6 +983,8 @@ def unallocated():
                                        "Tab": None, "Row": None},
                         disabled=[c for c in df.columns if c not in ("Give to", "Delete")])
     ed["Date"] = df["Date"]
+    if "Delete" not in ed.columns:
+        ed["Delete"] = False
     dels = ed[ed["Delete"] == True]                                    # noqa: E712
     picks = ed[ed["Give to"].notna() & (ed["Delete"] != True)]         # noqa: E712
 
@@ -1048,11 +1053,290 @@ def unallocated():
         if msgs or gone:
             st.session_state.pop("ua_sure", None)
             st.button("OK - refresh the list", key="ua_ok")
+    if not is_admin():
+        return
     st.divider()
     if st.button("Colour this month's schedule by CAD tech", key="ua_colour"):
         w = ws(cur_t)
         n = colour_tab(w) if w is not None else 0
         st.success(f"Coloured {n} lines on '{cur_t}': " + ", ".join(f"{t} {c}" for t, c in TECH_COLOURS.items()))
+
+
+# --------------------------------------------------------------------------------------
+# Drawing numbers (Drw. No. column) - next free number per tech, and clashes
+# --------------------------------------------------------------------------------------
+DN_RE = re.compile(r"^\s*([A-Za-z]{2,3})\s*-?\s*(\d{1,5})\s*$")
+
+
+def dn_parse(s):
+    m = DN_RE.match(str(s or ""))
+    return (m.group(1).upper(), int(m.group(2)), len(m.group(2))) if m else None
+
+
+def dn_runs(hist):
+    """Per tech: the numbers in the run they're on now. A big drop (e.g. DM248 -> DM02) means they restarted numbering,
+    so only numbers since the latest restart count. Returns {tech: {"next", "width", "used": [(n, entry)], "last"}}."""
+    out = {}
+    for h in hist:                                      # hist is oldest first
+        p = dn_parse(h.get("Drw. No."))
+        if not p:
+            continue
+        t, n, wdt = p
+        o = out.setdefault(t, {"used": [], "max": 0, "width": wdt})
+        if o["used"] and n < o["max"] - 20:              # restarted numbering
+            o["used"], o["max"] = [], 0
+        o["used"].append((n, h))
+        o["max"] = max(o["max"], n)
+        o["width"] = wdt
+    for t, o in out.items():
+        o["next"] = o["max"] + 1
+        o["last"] = o["used"][-1][1] if o["used"] else None
+    return out
+
+
+def dn_fmt(t, n, width):
+    return f"{t}{n:0{max(width, 2)}d}"
+
+
+def dn_clashes(hist, current_only=True):
+    """Drawing numbers used on more than one job (same number, different job / site)."""
+    runs = dn_runs(hist)
+    pool = [(n, h) for o in runs.values() for n, h in o["used"]] if current_only else \
+           [(dn_parse(h["Drw. No."])[1], h) for h in hist if dn_parse(h.get("Drw. No."))]
+    by = {}
+    for n, h in pool:
+        t = dn_parse(h["Drw. No."])[0]
+        by.setdefault((t, n), []).append(h)
+    out = []
+    for (t, n), hs in by.items():
+        jobs = {(h["Job"] or "-", h["Site"]) for h in hs}
+        if len(jobs) > 1:
+            out.append({"Number": dn_fmt(t, n, dn_parse(hs[0]["Drw. No."])[2]), "Jobs": len(jobs),
+                        "Used on": "; ".join(f"{h['Date']:%d/%m/%y} {h['Job'] or '-'} {h['Client']} - {h['Site']}" for h in hs)})
+    return sorted(out, key=lambda x: x["Number"])
+
+
+def drawing_numbers():
+    hist = all_history()
+    runs = dn_runs(hist)
+    today = dt.date.today()
+    cols = st.columns(len(CAD_TEAM))
+    for c, t in zip(cols, CAD_TEAM):
+        o = runs.get(t)
+        if o:
+            c.metric(f"{t} - next number", dn_fmt(t, o["next"], o["width"]))
+            lh = o["last"]
+            c.caption(f"Last used: {lh['Drw. No.']} on {lh['Date']:%d/%m/%y} ({lh['Job'] or '-'} {lh['Site']})")
+        else:
+            c.metric(f"{t} - next number", "-")
+    st.subheader("Give a line its drawing number")
+    tech = st.radio("CAD tech", CAD_TEAM, horizontal=True, key="dn_tech")
+    since = today - dt.timedelta(days=45)
+    cands = [h for h in hist if h["Drw. by"].upper() == tech and not h["Drw. No."] and h["Date"] >= since][::-1]
+    if not cands:
+        st.info(f"No lines for {tech} in the last 45 days without a drawing number.")
+    else:
+        pick = st.selectbox("Line on the schedule", range(len(cands)), key="dn_pick",
+                            format_func=lambda i: f"{cands[i]['Date']:%a %d/%m} - {cands[i]['Job'] or '-'} {cands[i]['Client']} - "
+                                                  f"{cands[i]['Site']}  {('(' + cands[i]['Notes'][:40] + ')') if cands[i]['Notes'] else ''}")
+        h = cands[pick]
+        o = runs.get(tech, {"next": 1, "width": 3, "used": []})
+        new = dn_fmt(tech, o["next"], o["width"])
+        before = [x for n, x in o["used"] if (x["Job"] or "-", x["Site"]) == (h["Job"] or "-", h["Site"])]
+        opts = [f"New number: {new}"]
+        if before:
+            opts.insert(0, f"Same drawing as before: {before[-1]['Drw. No.']} (used {before[-1]['Date']:%d/%m})")
+        choice = st.radio("Number", opts, key="dn_choice")
+        num = before[-1]["Drw. No."] if choice.startswith("Same") else new
+        if st.button(f"Put {num} on that line", type="primary", key="dn_go"):
+            w = ws(h["Tab"])
+            values = w.get_all_values()
+            r = h["Row"]
+            x = pad(values[r - 1]) if r - 1 < len(values) else pad([])
+            if not (x[C_JOB].strip() == h["Job"] and x[C_SITE].strip() == h["Site"] and not x[C_DWG].strip()):
+                r = next((i + 1 for i, y in enumerate(values) if pad(y)[C_JOB].strip() == h["Job"] and pad(y)[C_SITE].strip() == h["Site"]
+                          and pad(y)[C_DRAWN].strip().upper() == tech and not pad(y)[C_DWG].strip()), None)
+            if r is None:
+                st.warning("That line has moved or already has a number - press Refresh and try again.")
+            else:
+                w.update(range_name=f"I{r}", values=[[num]])
+                all_history.clear()
+                st.success(f"{num} written on '{h['Tab']}' row {r}.")
+    st.subheader("Clashes")
+    all_time = st.toggle("Check all history, not just the current numbering", key="dn_all")
+    cl = dn_clashes(hist, current_only=not all_time)
+    if cl:
+        st.warning(f"{len(cl)} drawing number(s) used on more than one job.")
+        st.dataframe(pd.DataFrame(cl), hide_index=True, use_container_width=True)
+    else:
+        st.success("No drawing number is used on two different jobs.")
+
+
+# --------------------------------------------------------------------------------------
+# Weekly report (admin)
+# --------------------------------------------------------------------------------------
+def is_admin():
+    return st.session_state.get("role") == "admin"
+
+
+def week_stats(hist, reqs, mon, today):
+    """Everything for the week Mon..Fri starting 'mon'."""
+    fri = mon + dt.timedelta(days=4)
+    wk = [h for h in hist if mon <= h["Date"] <= fri]
+    techs = list(CAD_TEAM)
+    work = [h for h in wk if h["Drw. by"].upper() in techs]
+    # days off / holidays from the schedule (needs the raw tabs - taken from history notes isn't possible, so use tech_load)
+    tabs = month_tabs(mon)
+    booked, off, days = tech_load(tabs)
+    wdays = [d for d in days if mon <= d <= fri]
+    first_seen = {}
+    for h in hist:
+        k = h["Job"] or h["Site"]
+        first_seen.setdefault(k, h["Date"])
+    per = {}
+    for t in techs:
+        mine = [h for h in work if h["Drw. by"].upper() == t]
+        hrs = sum(hours_of(h["Hrs"]) for h in mine)
+        nums_before = {h["Drw. No."] for h in hist if h["Drw. by"].upper() == t and h["Drw. No."] and h["Date"] < mon}
+        new_nums = sorted({h["Drw. No."] for h in mine if h["Drw. No."]} - nums_before)
+        avail = sum(DAY_HOURS for d in wdays if (d, t) not in off)
+        per[t] = {"Lines": len(mine), "Jobs": len({h["Job"] or h["Site"] for h in mine}),
+                  "Days off": sum(1 for d in wdays if (d, t) in off), "Hours logged": hrs, "Available": avail,
+                  "Lines with hours": sum(1 for h in mine if hours_of(h["Hrs"])), "New drawings": new_nums,
+                  "Over 8h": [f"{d:%a %d}" for d in wdays if booked.get((d, t), 0) > DAY_HOURS]}
+    by_client = {}
+    for h in work:
+        c = h["Client"] or "(no client)"
+        b = by_client.setdefault(c, {t: 0 for t in techs})
+        b[h["Drw. by"].upper()] += 1
+    new_jobs = sorted({(h["Job"] or "-", h["Client"], h["Site"]) for h in wk if first_seen.get(h["Job"] or h["Site"]) and
+                       mon <= first_seen[h["Job"] or h["Site"]] <= fri})
+    unalloc = [h for h in hist if h["Date"] >= mon - dt.timedelta(days=35) and not h["Drw. by"]]
+    overdue, urgent = [], []
+    for r in reqs:
+        try:
+            need = dt.datetime.strptime(r.get("Required by", ""), "%d/%m/%Y").date()
+        except ValueError:
+            need = None
+        status = request_status(r, hist)
+        if r.get("Urgent") and str(r.get("Submitted", ""))[:10]:
+            try:
+                sub = dt.datetime.strptime(r["Submitted"][:10], "%d/%m/%Y").date()
+            except ValueError:
+                sub = None
+            if sub and mon <= sub <= fri:
+                urgent.append({**r, "Status": status})
+        if need and need <= max(fri, today) and status in ("Waiting", "Not found on schedule"):
+            overdue.append({**r, "Status": status, "need": need})
+    return {"mon": mon, "fri": fri, "wdays": wdays, "per": per, "by_client": by_client, "new_jobs": new_jobs,
+            "unalloc": unalloc, "overdue": overdue, "urgent": urgent, "lines": len(work)}
+
+
+def weekly_pdf(S):
+    import io
+    from xml.sax.saxutils import escape as x_
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=10 * mm, rightMargin=10 * mm, topMargin=9 * mm, bottomMargin=10 * mm,
+                            title=f"CAD weekly report w/c {S['mon']:%d-%m-%Y}")
+    W = landscape(A4)[0] - 20 * mm
+    red = colors.HexColor(BRAND)
+    h1 = ParagraphStyle("h1", fontName="Helvetica-Bold", fontSize=16, leading=19)
+    h2 = ParagraphStyle("h2", fontName="Helvetica-Bold", fontSize=9.5, leading=12, textColor=red, spaceBefore=3)
+    p = ParagraphStyle("p", fontName="Helvetica", fontSize=8.2, leading=10.4)
+    c = ParagraphStyle("c", fontName="Helvetica", fontSize=7.2, leading=8.6)
+    head = Table([[Paragraph(f"CAD weekly report - w/c {S['mon']:%a %d %b %Y}", h1),
+                   Image(LOGO, width=28 * mm, height=28 * mm * 343 / 690) if os.path.exists(LOGO) else ""],
+                  [Paragraph(f"{S['mon']:%d/%m} - {S['fri']:%d/%m/%Y} · {len(S['wdays'])} working days · {S['lines']} lines drawn · "
+                             f"{len(S['new_jobs'])} new jobs · {len(S['unalloc'])} waiting for a CAD tech · {len(S['overdue'])} overdue", p), ""]],
+                 colWidths=[W - 32 * mm, 32 * mm])
+    head.setStyle(TableStyle([("SPAN", (1, 0), (1, 1)), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (1, 0), (1, 1), "RIGHT"),
+                              ("LINEBELOW", (0, 1), (-1, 1), 1.6, red), ("BOTTOMPADDING", (0, 1), (-1, 1), 5)]))
+    grid = [("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#aaaaaa")), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#333333")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 7.4),
+            ("FONT", (0, 1), (-1, -1), "Helvetica", 7.4), ("VALIGN", (0, 0), (-1, -1), "TOP")]
+    techs = list(S["per"])
+    t1 = [["", *techs, "Total"]]
+    keys = [("Lines", "Lines drawn"), ("Jobs", "Different jobs"), ("Hours logged", "Hours logged"), ("Available", "Hours available"),
+            ("Days off", "Days off")]
+    for k, lab in keys:
+        vals = [S["per"][t][k] for t in techs]
+        t1.append([lab, *[f"{v:g}" for v in vals], f"{sum(vals):g}"])
+    t1.append(["New drawing nos", *[str(len(S["per"][t]["New drawings"])) for t in techs],
+               str(sum(len(S["per"][t]["New drawings"]) for t in techs))])
+    t1.append(["Days over 8h", *[", ".join(S["per"][t]["Over 8h"]) or "-" for t in techs], ""])
+    tt1 = Table(t1, colWidths=[30 * mm] + [22 * mm] * len(techs) + [18 * mm])
+    s1 = list(grid)
+    for i, t in enumerate(techs, 1):
+        s1.append(("BACKGROUND", (i, 1), (i, -1), colors.HexColor(TECH_COLOURS.get(t, "#ffffff"))))
+    tt1.setStyle(TableStyle(s1))
+    cl = sorted(S["by_client"].items(), key=lambda kv: -sum(kv[1].values()))[:14]
+    t2 = [["Client (lines)", *techs, "Total"]] + [[Paragraph(x_(k), c), *[str(v[t] or "") for t in techs], str(sum(v.values()))] for k, v in cl]
+    tt2 = Table(t2, colWidths=[44 * mm] + [12 * mm] * len(techs) + [13 * mm])
+    tt2.setStyle(TableStyle(grid))
+    left = [Paragraph("Team", h2), tt1, Spacer(1, 3 * mm), Paragraph("Work by client", h2), tt2]
+    od = [["Required", "Job", "Client - site", "By", "Status"]] + [
+        [f"{r['need']:%d/%m}", r.get("Job No", ""), Paragraph(x_(f"{r.get('Client')} - {r.get('Site')}"), c), r.get("Requested by", ""),
+         Paragraph(x_(r["Status"]), c)] for r in sorted(S["overdue"], key=lambda r: r["need"])[:10]]
+    to = Table(od, colWidths=[14 * mm, 13 * mm, 62 * mm, 10 * mm, 30 * mm])
+    so = list(grid) + [("TEXTCOLOR", (0, 1), (-1, -1), red)]
+    to.setStyle(TableStyle(so))
+    ua = [["Date", "Job", "Client - site", "PM", "Hrs"]] + [
+        [f"{h['Date']:%d/%m}", h["Job"], Paragraph(x_(f"{h['Client']} - {h['Site']}"), c), h["PM"], h["Hrs"]] for h in S["unalloc"][-10:]]
+    tu = Table(ua, colWidths=[14 * mm, 13 * mm, 72 * mm, 12 * mm, 18 * mm])
+    tu.setStyle(TableStyle(grid))
+    nj = ", ".join(f"{j} {cl_}" for j, cl_, _ in S["new_jobs"][:18]) + (f" +{len(S['new_jobs']) - 18} more" if len(S["new_jobs"]) > 18 else "")
+    nd = "<br/>".join(f"<b>{t}</b>: {x_(', '.join(S['per'][t]['New drawings']) or '-')}" for t in techs)
+    right = [Paragraph(f"Overdue / due - not given out ({len(S['overdue'])})", h2), to if len(od) > 1 else Paragraph("None.", p),
+             Paragraph(f"Waiting for a CAD tech ({len(S['unalloc'])})", h2), tu if len(ua) > 1 else Paragraph("None.", p),
+             Paragraph(f"Urgent requests this week ({len(S['urgent'])})", h2),
+             Paragraph(x_(", ".join(f"{r.get('Job No')} {r.get('Site')} ({r['Status']})" for r in S["urgent"][:8])) or "None.", p),
+             Paragraph("New drawing numbers", h2), Paragraph(nd, c), Paragraph("New jobs on the schedule", h2), Paragraph(x_(nj) or "None.", c)]
+    body = Table([[left, right]], colWidths=[W * 0.47, W * 0.53])
+    body.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+    nohrs = sum(S["per"][t]["Lines"] - S["per"][t]["Lines with hours"] for t in techs)
+
+    def foot(cv, d):
+        cv.setFont("Helvetica", 6.8)
+        cv.drawString(10 * mm, 5.5 * mm, f"From the cad schedule, printed {uk_now():%d/%m/%Y %H:%M}. {nohrs} of {S['lines']} lines had no hours "
+                                         "entered - hours logged only counts lines with hours.")
+    doc.build([head, Spacer(1, 2 * mm), body], onFirstPage=foot, onLaterPages=foot)
+    return buf.getvalue()
+
+
+def weekly_report():
+    today = dt.date.today()
+    last_mon = today - dt.timedelta(days=today.weekday() + 7)
+    weeks = [last_mon + dt.timedelta(days=7 * k) for k in range(-11, 2)][::-1]
+    mon = st.selectbox("Week commencing", weeks, index=1, format_func=lambda d: f"{d:%a %d %b %Y}"
+                       + (" (this week)" if d <= today <= d + dt.timedelta(days=6) else " (last week)" if d == last_mon else ""),
+                       key="wk_mon")
+    S = week_stats(all_history(), saved_requests(), mon, today)
+    techs = list(S["per"])
+    cols = st.columns(4)
+    cols[0].metric("Lines drawn", S["lines"])
+    cols[1].metric("New jobs", len(S["new_jobs"]))
+    cols[2].metric("Waiting for a CAD tech", len(S["unalloc"]))
+    cols[3].metric("Overdue", len(S["overdue"]))
+    df = pd.DataFrame({t: {"Lines drawn": S["per"][t]["Lines"], "Different jobs": S["per"][t]["Jobs"],
+                           "Hours logged": f"{S['per'][t]['Hours logged']:g}", "Hours available": f"{S['per'][t]['Available']:g}",
+                           "Days off": S["per"][t]["Days off"], "New drawing nos": len(S["per"][t]["New drawings"]),
+                           "Days over 8h": ", ".join(S["per"][t]["Over 8h"]) or "-"} for t in techs})
+    st.dataframe(df.astype(str), use_container_width=True)
+    if S["by_client"]:
+        st.caption("Lines by client")
+        st.dataframe(pd.DataFrame(S["by_client"]).T.sort_values(by=techs, ascending=False), use_container_width=True)
+    if has_pdf():
+        st.download_button("Download the weekly report (PDF, one page)", weekly_pdf(S), f"CAD weekly report w-c {mon:%d-%m-%Y}.pdf",
+                           "application/pdf", type="primary", key="wk_pdf")
+    total = sum(S["per"][t]["Lines"] for t in techs) or 1
+    shares = ", ".join(f"{t} {100 * S['per'][t]['Lines'] / total:.0f}%" for t in techs)
+    st.caption(f"Share of the week's lines: {shares}. Hours are only as good as the 'time' column - "
+               f"{sum(S['per'][t]['Lines with hours'] for t in techs)} of {S['lines']} lines had hours on them.")
 
 
 def find_job():
@@ -1093,28 +1377,59 @@ def find_job():
 # Page
 # --------------------------------------------------------------------------------------
 pw = str(_secret("app_password", "") or "").strip()
-_tok = __import__("hashlib").sha256(("cadreq:" + pw).encode()).hexdigest()[:16] if pw else ""
-if pw and st.query_params.get("k") == _tok:               # remembered in the page address - refresh doesn't log you out
-    st.session_state["ok"] = pw
-if pw and st.session_state.get("ok") != pw:
-    page_style()
+apw = str(_secret("admin_password", "") or "").strip()
+
+
+def _tok(p):
+    return __import__("hashlib").sha256(("cadreq:" + p).encode()).hexdigest()[:16] if p else ""
+
+
+k_ = st.query_params.get("k")                              # remembered in the page address - refresh doesn't log you out
+if apw and k_ == _tok(apw):
+    st.session_state["role"] = "admin"
+elif pw and k_ == _tok(pw) and st.session_state.get("role") != "admin":
+    st.session_state["role"] = "team"
+if not pw and st.session_state.get("role") != "admin":
+    st.session_state["role"] = "team"                      # no team password set - open to all
+
+
+def _login_form(label="Log in"):
     with st.form("login"):
         typed = st.text_input("Password", type="password")
-        go = st.form_submit_button("Log in", type="primary")
+        go = st.form_submit_button(label, type="primary")
     if go:
-        if typed.strip() == pw:
-            st.session_state["ok"] = pw
-            st.query_params["k"] = _tok
+        t = typed.strip()
+        if apw and t == apw:
+            st.session_state["role"], st.query_params["k"] = "admin", _tok(apw)
             st.rerun()
-        st.error("Wrong password - it's the app_password set in the app's Secrets.")
+        if pw and t == pw:
+            st.session_state["role"], st.query_params["k"] = "team", _tok(pw)
+            st.rerun()
+        if not apw and not pw:
+            st.error("No passwords are set up in the app's Secrets yet.")
+        elif not apw:
+            st.error("Wrong password. (There's no admin_password in the app's Secrets yet - add it under app_password, "
+                     "Save, then try again.)")
+        else:
+            st.error("Wrong password - it has to match app_password or admin_password in the app's Secrets exactly.")
+
+
+if not st.session_state.get("role"):
+    page_style()
+    _login_form()
     st.stop()
 
 page_style()
+if apw and not is_admin():
+    _a1, _a2 = st.columns([4, 1])
+    with _a2.expander("Admin log in"):
+        _login_form("Log in as admin")
 TOOL_HELP = {
     "New Request": "Ask the CAD team for artwork",
     "Unallocated Jobs": "Give waiting jobs to a CAD tech",
     "Find a Job": "Job history and Clarity folder",
     "Saved Requests": "Every request made, for reference",
+    "Drawing Numbers": "Next number per tech, and clashes",
 }
 TOOL_HOWTO = {
     "New Request": [
@@ -1138,6 +1453,13 @@ TOOL_HOWTO = {
         "just emptied so the day keeps its layout. The request stays in Saved Requests, marked as deleted.",
         "If someone's added lines since you opened the page, it finds the job again before writing, so nothing lands on the wrong row.",
     ],
+    "Drawing Numbers": [
+        "Shows the next drawing number for each tech, worked out from the Drw. No. column on the schedule.",
+        "It follows each tech's current run - when the numbers start again (e.g. DM248 then DM02) it counts from the restart.",
+        "Pick a line that hasn't got a number yet and press the button to write the next number into Drw. No. If that job has "
+        "had a number from you before, it offers to use the same one again.",
+        "Clashes lists any number used on two different jobs, so the same number never goes on two drawings.",
+    ],
     "Saved Requests": [
         "Every request made through New Request is kept here, newest first, with who it was given to from the schedule.",
         "Search by job number, client, site or initials. Open one to see the full request and download it as a one-page PDF "
@@ -1149,7 +1471,20 @@ TOOL_HOWTO = {
         "The Clarity folder path is shown to copy into Explorer. Run the app on an office PC and you get an Open folder button.",
     ],
 }
-tool = st.radio("Tool", list(TOOL_HELP), horizontal=True, key="tool", label_visibility="collapsed", captions=list(TOOL_HELP.values()))
+ADMIN_TOOLS = ["Weekly Report", "Drawing Numbers"]
+TOOL_HELP["Weekly Report"] = "Hours, drawings and what's waiting"
+TOOL_HOWTO["Weekly Report"] = [
+    "Admin only. Pick a week - it shows each tech's lines, jobs, hours logged vs available, days off, new drawing numbers and "
+    "any day over 8 hours, plus work by client.",
+    "Download it as a one-page A4 PDF with what's overdue, what's waiting for a CAD tech, urgent requests and new jobs.",
+    "Hours only count where the 'time' column has been filled in - the report says how many lines had hours.",
+]
+names = [t for t in TOOL_HELP if is_admin() or t not in ADMIN_TOOLS]
+if is_admin():
+    names = [t for t in names if t not in ADMIN_TOOLS] + ADMIN_TOOLS
+tool = st.radio("Tool", names, horizontal=True, key="tool", label_visibility="collapsed", captions=[TOOL_HELP[t] for t in names])
+if is_admin():
+    st.caption(":red[**Admin**] - you can see the weekly report, drawing numbers, delete and colour tools.")
 with st.expander(f"How to use: {tool}", expanded=False):
     for line in TOOL_HOWTO[tool]:
         st.markdown(f"- {line}")
@@ -1180,5 +1515,16 @@ elif tool == "Unallocated Jobs":
     unallocated()
 elif tool == "Saved Requests":
     saved_screen()
+elif tool == "Weekly Report":
+    weekly_report()
+elif tool == "Drawing Numbers":
+    drawing_numbers()
 else:
     find_job()
+
+st.divider()
+if is_admin():
+    if st.button("Log out of admin", key="lo_admin"):
+        st.session_state["role"] = "team" if not pw else None
+        st.query_params.clear()
+        st.rerun()
