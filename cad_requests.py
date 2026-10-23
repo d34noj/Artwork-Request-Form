@@ -21,7 +21,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LOGO = os.path.join(HERE, "geetee_logo.png")
 BRAND = "#D60C4D"                                  # GeeTee red, taken from the logo
 
-st.set_page_config(page_title="CAD Requests | GeeTee", page_icon=LOGO if os.path.exists(LOGO) else None, layout="wide")
+# Only when run as its own app - the Store Signage Tools app imports this file for Find a Job
+if __name__ == "__main__":
+    st.set_page_config(page_title="CAD Requests | GeeTee", page_icon=LOGO if os.path.exists(LOGO) else None, layout="wide")
 
 
 def page_style():
@@ -195,7 +197,7 @@ def boxed_rows(w, n):
     """1-based rows whose Client (C) cell has a border - i.e. the schedule's boxes."""
     try:
         meta = w.spreadsheet.fetch_sheet_metadata(params={
-            "ranges": f"'{w.title}'!C1:C{max(n, 1) + 5}", "includeGridData": "true",
+            "ranges": "'%s'!%s1:%s%d" % (w.title, *([col_letter(C_CLIENT + getattr(w, "off", 0))] * 2), max(n, 1) + 5), "includeGridData": "true",
             "fields": "sheets.data.rowData.values.userEnteredFormat.borders"})
         rows = meta["sheets"][0]["data"][0].get("rowData", [])
     except Exception:
@@ -208,12 +210,34 @@ def boxed_rows(w, n):
     return out
 
 
+SHORT_NOTE = 40
+
+
+def short_note(text, n=SHORT_NOTE):
+    """What goes in the Notes cell: the first bit of the request ('See quote; 3 no sets of ...' -> 'See quote ...').
+    The whole text goes in the cell's note, so nothing spills across the sheet."""
+    t = " ".join(str(text or "").split())
+    if len(t) <= n:
+        return t
+    first = re.split(r"[;.\n]", str(text).strip(), maxsplit=1)[0].strip()
+    if 0 < len(first) <= n:
+        return first + " ..."
+    cut = t[:n].rsplit(" ", 1)[0] if " " in t[:n] else t[:n]
+    return cut.rstrip(",;:-") + " ..."
+
+
+def same_request_text(full, cell):
+    """The log keeps the full text; the schedule cell may hold the short version."""
+    full, cell = str(full or "").strip(), str(cell or "").strip()
+    return full == cell or short_note(full) == cell
+
+
 def build_row(job, client, site, pm, hours, notes, folder=""):
     """Columns A-I only - nothing is written past Drw. No."""
     r = [""] * (C_DWG + 1)
     r[C_JOB], r[C_CLIENT], r[C_SITE], r[C_PM] = str(job).strip(), client.strip(), site.strip(), pm.strip().upper()
     r[C_TIME] = (f"{hours:g}" if isinstance(hours, (int, float)) and hours else str(hours or "")).strip()
-    r[C_NOTES] = notes.strip()
+    r[C_NOTES] = short_note(notes)
     return r
 
 
@@ -288,10 +312,101 @@ def book():
     return gspread.service_account_from_dict(creds).open_by_key(SHEET_ID)
 
 
+_A1 = re.compile(r"(?<![A-Za-z_'!])(\$?)([A-Z]{1,2})(\$?)(\d+)")
+
+
+def col_letter(n):
+    """0 -> A, 25 -> Z, 26 -> AA"""
+    s = ""
+    n += 1
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def col_index(letters):
+    n = 0
+    for ch in letters:
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
+
+def shift_a1(text, off):
+    """'A5:I5' -> 'B5:J5', '=SUM(F3:F9)' -> '=SUM(G3:G9)' when off = 1."""
+    if not off:
+        return text
+    return _A1.sub(lambda m: f"{m.group(1)}{col_letter(col_index(m.group(2)) + off)}{m.group(3)}{m.group(4)}", str(text))
+
+
+def has_done_col(values):
+    """Newer month tabs have a 'Done' tick-box column in front of everything (A1 = Done)."""
+    return bool(values) and bool(values[0]) and str(values[0][0]).strip().lower() == "done"
+
+
+def strip_done(values):
+    """Drop the Done column so every tab reads the same: count/priority, job no., client, site ..."""
+    return [list(r[1:]) for r in values] if has_done_col(values) else values
+
+
+PRIORITY_LIST = [str(i) for i in range(1, 13)]
+
+
+class Tab:
+    """A month tab. With a Done column at the front (off = 1) it shifts every read and write by one column, so the
+    rest of the app works in the old layout (A = count/priority, B = job no. ... I = Drw. No.)."""
+
+    def __init__(self, w):
+        self.w = w
+        try:
+            self.off = 1 if str(w.acell("A1").value or "").strip().lower() == "done" else 0
+        except Exception:
+            self.off = 0
+
+    def __getattr__(self, k):                      # title, id, spreadsheet, delete_rows ...
+        return getattr(self.w, k)
+
+    def get_all_values(self, *a, **k):
+        v = self.w.get_all_values(*a, **k)
+        return [list(r[self.off:]) for r in v] if self.off else v
+
+    def update(self, range_name=None, values=None, **k):
+        if self.off and values is not None:
+            values = [[shift_a1(x, self.off) if isinstance(x, str) and x.startswith("=") else x for x in r] for r in values]
+        return self.w.update(range_name=shift_a1(range_name, self.off), values=values, **k)
+
+    def format(self, rng, fmt, **k):
+        return self.w.format(shift_a1(rng, self.off), fmt, **k)
+
+    def acell(self, a1, **k):
+        return self.w.acell(shift_a1(a1, self.off), **k)
+
+    def insert_row(self, row, index=1, **k):
+        return self.w.insert_row(([""] * self.off) + list(row), index=index, **k)
+
+    def col(self, i):
+        """Real 0-based column index for a column of the old layout."""
+        return i + self.off
+
+    def add_controls(self, r):
+        """Done tick-box (A) and priority dropdown (B) on row r - only on tabs that have the Done column."""
+        if not self.off:
+            return
+        g = lambda c: {"sheetId": self.w.id, "startRowIndex": r - 1, "endRowIndex": r, "startColumnIndex": c, "endColumnIndex": c + 1}
+        self.w.spreadsheet.batch_update({"requests": [
+            {"setDataValidation": {"range": g(0), "rule": {"condition": {"type": "BOOLEAN"}, "showCustomUi": True}}},
+            {"setDataValidation": {"range": g(1), "rule": {"condition": {"type": "ONE_OF_LIST", "values": [
+                {"userEnteredValue": x} for x in PRIORITY_LIST]}, "strict": False, "showCustomUi": True}}}]})
+
+    def clear_done(self, r):
+        if self.off:
+            self.w.update(range_name=f"A{r}", values=[[False]], value_input_option="USER_ENTERED")
+
+
 def ws(title):
     for w in book().worksheets():
         if w.title.strip().lower() == title.lower():
-            return w
+            return Tab(w) if tab_month(w.title) else w
     return None
 
 
@@ -299,8 +414,8 @@ def ws(title):
 def all_history():
     b = book()
     titles = [w.title for w in b.worksheets() if tab_month(w.title)]
-    res = b.values_batch_get([f"'{t}'!A1:J" for t in titles]).get("valueRanges", [])
-    tabs = {t: r.get("values", []) for t, r in zip(titles, res)}
+    res = b.values_batch_get([f"'{t}'!A1:K" for t in titles]).get("valueRanges", [])
+    tabs = {t: strip_done(r.get("values", [])) for t, r in zip(titles, res)}
     return history_from(tabs)
 
 
@@ -318,7 +433,7 @@ RED = {"red": 0.86, "green": 0.0, "blue": 0.0}
 BLACK = {"red": 0.0, "green": 0.0, "blue": 0.0}
 
 
-def add_request(d, row, urgent=False):
+def add_request(d, row, urgent=False, note=""):
     w = ws(tab_name(d))
     if w is None:
         raise RuntimeError(f"There's no '{tab_name(d)}' tab on the schedule yet - make the month tab first.")
@@ -354,7 +469,8 @@ def add_request(d, row, urgent=False):
     src = plan["fmt_src"]
     if src:                                  # same boxes / borders as the line above it
         try:
-            g = lambda r: {"sheetId": w.id, "startRowIndex": r - 1, "endRowIndex": r, "startColumnIndex": 0, "endColumnIndex": C_DWG + 1}
+            g = lambda r: {"sheetId": w.id, "startRowIndex": r - 1, "endRowIndex": r, "startColumnIndex": 0,
+                           "endColumnIndex": C_DWG + 1 + getattr(w, "off", 0)}
             w.spreadsheet.batch_update({"requests": [{"copyPaste": {"source": g(src), "destination": g(at), "pasteType": "PASTE_FORMAT"}}]})
         except Exception:
             pass
@@ -366,6 +482,15 @@ def add_request(d, row, urgent=False):
     try:                                     # URGENT = whole line in red; otherwise make sure it isn't red from the line above
         w.format(f"A{at}:I{at}", {"textFormat": {"foregroundColor": RED if urgent else BLACK, "bold": bool(urgent)}})
         colour_rows(w, {at: row[C_DRAWN]})
+    except Exception:
+        pass
+    note = note or row[C_NOTES]
+    if note:                                 # full 'What's needed' as a cell note - hover over the Notes cell to read it all
+        add_note(w, at, note)
+    try:                                     # Done tick-box + priority dropdown on the new line
+        if hasattr(w, "add_controls"):
+            w.add_controls(at)
+            w.clear_done(at)
     except Exception:
         pass
     fix_day_total(w, day)
@@ -430,13 +555,36 @@ def next_slot(booked, off, days, t, hrs, after):
     return None, 0.0
 
 
+def add_note(w, r, note):
+    """Full request text as a note on the Notes cell of row r. Tries twice, then says so on screen rather than failing quietly."""
+    c = C_NOTES + getattr(w, "off", 0)
+    err = None
+    try:
+        w.spreadsheet.batch_update({"requests": [{"updateCells": {
+            "range": {"sheetId": w.id, "startRowIndex": r - 1, "endRowIndex": r, "startColumnIndex": c, "endColumnIndex": c + 1},
+            "rows": [{"values": [{"note": note}]}], "fields": "note"}}]})
+        return True
+    except Exception as e:
+        err = e
+    try:
+        raw = getattr(w, "w", w)
+        raw.update_note(f"{col_letter(c)}{r}", note)
+        return True
+    except Exception as e:
+        err = f"{err} / {e}"
+    st.session_state["nr_note_err"] = (f"It's on the schedule, but the full text couldn't be added as a note on the line "
+                                       f"(row {r}): {err}. The full text is in Saved Requests.")
+    return False
+
+
 def colour_rows(w, rows):
     """rows = {row: tech or ''} -> fill the boxes (B-I) in that tech's colour (white if nobody)."""
     reqs = []
+    off = getattr(w, "off", 0)
     for r, t in rows.items():
         col = TECH_COLOURS.get(str(t).strip().upper(), "#FFFFFF")
-        reqs.append({"repeatCell": {"range": {"sheetId": w.id, "startRowIndex": r - 1, "endRowIndex": r, "startColumnIndex": 1,
-                                              "endColumnIndex": C_DWG + 1},
+        reqs.append({"repeatCell": {"range": {"sheetId": w.id, "startRowIndex": r - 1, "endRowIndex": r, "startColumnIndex": 1 + off,
+                                              "endColumnIndex": C_DWG + 1 + off},
                                     "cell": {"userEnteredFormat": {"backgroundColor": _hex(col)}},
                                     "fields": "userEnteredFormat.backgroundColor"}})
     for k in range(0, len(reqs), 400):
@@ -500,11 +648,12 @@ def move_job(tab, row, job, site, notes, tech, day):
     if t is None:
         return False
     line = pad(values[t - 1])[:C_DWG + 1]
-    urgent = any(r.get("Urgent") and r.get("Job No", "").strip() == job and r.get("Site", "").strip() == site
-                 for r in saved_requests())
+    mine = [r for r in saved_requests() if r.get("Job No", "").strip() == job and r.get("Site", "").strip() == site]
+    urgent = any(r.get("Urgent") for r in mine)
+    full = next((r.get("What's needed", "") for r in reversed(mine) if same_request_text(r.get("What's needed", ""), notes)), "")
     delete_jobs([(tab, t, job, site, notes)], log=False)
     line[C_DRAWN] = tech
-    add_request(day, line, urgent)
+    add_request(day, line, urgent, full)          # the full text goes back on as the note
     return True
 
 
@@ -545,6 +694,8 @@ def delete_jobs(items, log=True):
             else:
                 w.update(range_name=f"A{t}:I{t}", values=[[""] * (C_DWG + 1)])
                 try:
+                    if hasattr(w, "clear_done"):
+                        w.clear_done(t)
                     w.format(f"A{t}:I{t}", {"textFormat": {"foregroundColor": BLACK, "bold": False}})
                     colour_rows(w, {t: ""})
                 except Exception:
@@ -571,7 +722,7 @@ def mark_log_deleted(job, site, notes):
         for i in range(len(v) - 1, 0, -1):
             r = pad(v[i], len(head))
             if r[ix.get("Job No", 0)].strip() == job and r[ix.get("Site", 0)].strip() == site \
-                    and r[ix.get("What's needed", 0)].strip() == notes and not r[col].strip():
+                    and same_request_text(r[ix.get("What's needed", 0)], notes) and not r[col].strip():
                 a1 = chr(65 + col) if col < 26 else "A" + chr(65 + col - 26)
                 w.update(range_name=f"{a1}{i + 1}", values=[[f"{uk_now():%d/%m/%Y %H:%M}"]])
                 break
@@ -669,7 +820,8 @@ def request_status(rec, hist):
         day = None
     rows = [h for h in hist if (h["Job"] == job if job else h["Site"] == site) and (day is None or h["Date"] >= day)]
     det = rec.get("What's needed", "").strip()[:40]
-    exact = [h for h in rows if det and det in h["Notes"]]       # the very line this request made
+    full = rec.get("What's needed", "")
+    exact = [h for h in rows if det and (det in h["Notes"] or same_request_text(full, h["Notes"]))]   # the very line this request made
     if exact:
         rows = exact
     drawn = [h["Drw. by"] for h in rows if h["Drw. by"]]
@@ -833,6 +985,8 @@ def new_request():
                 logo_party()
             if done.get("Urgent"):
                 st.error("URGENT - it's in red on the schedule.")
+            if st.session_state.get("nr_note_err"):
+                st.warning(st.session_state["nr_note_err"])
             st.success(f"Request {done['Ref']} sent - it's on the cad schedule ('{done['Schedule tab']}', under "
                        f"{done['On schedule'][:5].replace('/', '-')}){' given to ' + done['Drawn by'] if done.get('Drawn by') else ' with Drw. by blank'}, and saved in Saved Requests.")
             needed = done.get("What's needed", "")
@@ -897,10 +1051,14 @@ def _new_request():
                if not str(v).strip()]
     if st.button("Submit request", type="primary", key="nr_go", disabled=bool(missing) or st.session_state.get("nr_sending", False)):
         st.session_state["nr_sending"] = True
+        st.session_state.pop("nr_note_err", None)
         row = build_row(job, client, site, pm, hours, notes, folder)
         row[C_DRAWN] = tech
         try:
-            tab, at, used = add_request(day, row, urgent)
+            now0 = uk_now()
+            note = (details.strip() + f"\n\nRequested by {pm.strip().upper()} - {now0:%d/%m/%Y %H:%M}"
+                    + (f"\nRequired by {need:%a %d/%m}" if need else "") + ("\nURGENT" if urgent else ""))
+            tab, at, used = add_request(day, row, urgent, note)
         except DuplicateRequest as e:
             st.session_state["nr_sending"] = False
             st.warning(str(e))
@@ -1376,155 +1534,157 @@ def find_job():
 # --------------------------------------------------------------------------------------
 # Page
 # --------------------------------------------------------------------------------------
-pw = str(_secret("app_password", "") or "").strip()
-apw = str(_secret("admin_password", "") or "").strip()
+# Runs only when this file is the app itself (streamlit run cad_requests.py), not when it's imported.
+if __name__ == "__main__":
+    pw = str(_secret("app_password", "") or "").strip()
+    apw = str(_secret("admin_password", "") or "").strip()
 
 
-def _tok(p):
-    return __import__("hashlib").sha256(("cadreq:" + p).encode()).hexdigest()[:16] if p else ""
+    def _tok(p):
+        return __import__("hashlib").sha256(("cadreq:" + p).encode()).hexdigest()[:16] if p else ""
 
 
-k_ = st.query_params.get("k")                              # remembered in the page address - refresh doesn't log you out
-if apw and k_ == _tok(apw):
-    st.session_state["role"] = "admin"
-elif pw and k_ == _tok(pw) and st.session_state.get("role") != "admin":
-    st.session_state["role"] = "team"
-if not pw and st.session_state.get("role") != "admin":
-    st.session_state["role"] = "team"                      # no team password set - open to all
+    k_ = st.query_params.get("k")                              # remembered in the page address - refresh doesn't log you out
+    if apw and k_ == _tok(apw):
+        st.session_state["role"] = "admin"
+    elif pw and k_ == _tok(pw) and st.session_state.get("role") != "admin":
+        st.session_state["role"] = "team"
+    if not pw and st.session_state.get("role") != "admin":
+        st.session_state["role"] = "team"                      # no team password set - open to all
 
 
-def _login_form(label="Log in"):
-    with st.form("login"):
-        typed = st.text_input("Password", type="password")
-        go = st.form_submit_button(label, type="primary")
-    if go:
-        t = typed.strip()
-        if apw and t == apw:
-            st.session_state["role"], st.query_params["k"] = "admin", _tok(apw)
-            st.rerun()
-        if pw and t == pw:
-            st.session_state["role"], st.query_params["k"] = "team", _tok(pw)
-            st.rerun()
-        if not apw and not pw:
-            st.error("No passwords are set up in the app's Secrets yet.")
-        elif not apw:
-            st.error("Wrong password. (There's no admin_password in the app's Secrets yet - add it under app_password, "
-                     "Save, then try again.)")
-        else:
-            st.error("Wrong password - it has to match app_password or admin_password in the app's Secrets exactly.")
+    def _login_form(label="Log in"):
+        with st.form("login"):
+            typed = st.text_input("Password", type="password")
+            go = st.form_submit_button(label, type="primary")
+        if go:
+            t = typed.strip()
+            if apw and t == apw:
+                st.session_state["role"], st.query_params["k"] = "admin", _tok(apw)
+                st.rerun()
+            if pw and t == pw:
+                st.session_state["role"], st.query_params["k"] = "team", _tok(pw)
+                st.rerun()
+            if not apw and not pw:
+                st.error("No passwords are set up in the app's Secrets yet.")
+            elif not apw:
+                st.error("Wrong password. (There's no admin_password in the app's Secrets yet - add it under app_password, "
+                         "Save, then try again.)")
+            else:
+                st.error("Wrong password - it has to match app_password or admin_password in the app's Secrets exactly.")
 
 
-if not st.session_state.get("role"):
+    if not st.session_state.get("role"):
+        page_style()
+        _login_form()
+        st.stop()
+
     page_style()
-    _login_form()
-    st.stop()
-
-page_style()
-if apw and not is_admin():
-    _a1, _a2 = st.columns([4, 1])
-    with _a2.expander("Admin log in"):
-        _login_form("Log in as admin")
-TOOL_HELP = {
-    "New Request": "Ask the CAD team for artwork",
-    "Unallocated Jobs": "Give waiting jobs to a CAD tech",
-    "Find a Job": "Job history and Clarity folder",
-    "Saved Requests": "Every request made, for reference",
-    "Drawing Numbers": "Next number per tech, and clashes",
-}
-TOOL_HOWTO = {
-    "New Request": [
-        "Type the Clarity job number. If it's been on the schedule before, the client, site and PM fill themselves in.",
-        "Add the estimated hours, the date you need it by and what's needed, then press Submit request.",
-        "Pick who's drawing it (DJ / DM / JA) if you know - each shows their free hours that day out of 8. If they're full, it "
-        "offers their next free day. Leave it on 'Not decided' and it goes on Unallocated Jobs for the CAD team.",
-        "It goes into this month's tab under the date you pick (today unless you change it), at the bottom of that day, "
-        "with Drw. by left blank. Tick URGENT and the whole line goes in red.",
-        "No job number yet? Leave it blank and fill in the site instead.",
-    ],
-    "Unallocated Jobs": [
-        "Lists every line on this month's and last month's tabs with a PM but no Drw. by.",
-        "Pick a name in the 'Give to' column for as many as you like, then press Save - it writes their initials into Drw. by.",
-        "The CAD time table shows each tech's booked hours per day out of 8 (holidays like 'JAY HOLIDAY' count as off).",
-        "When you give a job out, it checks the tech still has room that day. If not, it shows the next day they're free and "
-        "(ticked by default) moves the line to that day when you Save.",
-        "Lines are filled in each tech's colour (DJ grey, DM blue, JA pink). 'Colour this month's schedule' does the whole tab "
-        "in one go for lines given out by hand.",
-        "Tick 'Delete' to take a line off the schedule (it asks you to confirm). If it's the only job under that date, the box is "
-        "just emptied so the day keeps its layout. The request stays in Saved Requests, marked as deleted.",
-        "If someone's added lines since you opened the page, it finds the job again before writing, so nothing lands on the wrong row.",
-    ],
-    "Drawing Numbers": [
-        "Shows the next drawing number for each tech, worked out from the Drw. No. column on the schedule.",
-        "It follows each tech's current run - when the numbers start again (e.g. DM248 then DM02) it counts from the restart.",
-        "Pick a line that hasn't got a number yet and press the button to write the next number into Drw. No. If that job has "
-        "had a number from you before, it offers to use the same one again.",
-        "Clashes lists any number used on two different jobs, so the same number never goes on two drawings.",
-    ],
-    "Saved Requests": [
-        "Every request made through New Request is kept here, newest first, with who it was given to from the schedule.",
-        "Search by job number, client, site or initials. Open one to see the full request and download it as a one-page PDF "
-        "request sheet (with the GeeTee logo) for the job file.",
-        "They're stored on a 'Requests Log' tab in the cad schedule, so nothing is lost when the app restarts. Don't edit that tab by hand.",
-    ],
-    "Find a Job": [
-        "Type a job number for its full history on the schedule, or a client / site name to search.",
-        "The Clarity folder path is shown to copy into Explorer. Run the app on an office PC and you get an Open folder button.",
-    ],
-}
-ADMIN_TOOLS = ["Weekly Report", "Drawing Numbers"]
-TOOL_HELP["Weekly Report"] = "Hours, drawings and what's waiting"
-TOOL_HOWTO["Weekly Report"] = [
-    "Admin only. Pick a week - it shows each tech's lines, jobs, hours logged vs available, days off, new drawing numbers and "
-    "any day over 8 hours, plus work by client.",
-    "Download it as a one-page A4 PDF with what's overdue, what's waiting for a CAD tech, urgent requests and new jobs.",
-    "Hours only count where the 'time' column has been filled in - the report says how many lines had hours.",
-]
-names = [t for t in TOOL_HELP if is_admin() or t not in ADMIN_TOOLS]
-if is_admin():
-    names = [t for t in names if t not in ADMIN_TOOLS] + ADMIN_TOOLS
-tool = st.radio("Tool", names, horizontal=True, key="tool", label_visibility="collapsed", captions=[TOOL_HELP[t] for t in names])
-if is_admin():
-    st.caption(":red[**Admin**] - you can see the weekly report, drawing numbers, delete and colour tools.")
-with st.expander(f"How to use: {tool}", expanded=False):
-    for line in TOOL_HOWTO[tool]:
-        st.markdown(f"- {line}")
-try:
-    book()
-except Exception as e:
-    msg, name = str(e).strip(), type(e).__name__
-    robot = ""
+    if apw and not is_admin():
+        _a1, _a2 = st.columns([4, 1])
+        with _a2.expander("Admin log in"):
+            _login_form("Log in as admin")
+    TOOL_HELP = {
+        "New Request": "Ask the CAD team for artwork",
+        "Unallocated Jobs": "Give waiting jobs to a CAD tech",
+        "Find a Job": "Job history and Clarity folder",
+        "Saved Requests": "Every request made, for reference",
+        "Drawing Numbers": "Next number per tech, and clashes",
+    }
+    TOOL_HOWTO = {
+        "New Request": [
+            "Type the Clarity job number. If it's been on the schedule before, the client, site and PM fill themselves in.",
+            "Add the estimated hours, the date you need it by and what's needed, then press Submit request.",
+            "Pick who's drawing it (DJ / DM / JA) if you know - each shows their free hours that day out of 8. If they're full, it "
+            "offers their next free day. Leave it on 'Not decided' and it goes on Unallocated Jobs for the CAD team.",
+            "It goes into this month's tab under the date you pick (today unless you change it), at the bottom of that day, "
+            "with Drw. by left blank. Tick URGENT and the whole line goes in red.",
+            "No job number yet? Leave it blank and fill in the site instead.",
+        ],
+        "Unallocated Jobs": [
+            "Lists every line on this month's and last month's tabs with a PM but no Drw. by.",
+            "Pick a name in the 'Give to' column for as many as you like, then press Save - it writes their initials into Drw. by.",
+            "The CAD time table shows each tech's booked hours per day out of 8 (holidays like 'JAY HOLIDAY' count as off).",
+            "When you give a job out, it checks the tech still has room that day. If not, it shows the next day they're free and "
+            "(ticked by default) moves the line to that day when you Save.",
+            "Lines are filled in each tech's colour (DJ grey, DM blue, JA pink). 'Colour this month's schedule' does the whole tab "
+            "in one go for lines given out by hand.",
+            "Tick 'Delete' to take a line off the schedule (it asks you to confirm). If it's the only job under that date, the box is "
+            "just emptied so the day keeps its layout. The request stays in Saved Requests, marked as deleted.",
+            "If someone's added lines since you opened the page, it finds the job again before writing, so nothing lands on the wrong row.",
+        ],
+        "Drawing Numbers": [
+            "Shows the next drawing number for each tech, worked out from the Drw. No. column on the schedule.",
+            "It follows each tech's current run - when the numbers start again (e.g. DM248 then DM02) it counts from the restart.",
+            "Pick a line that hasn't got a number yet and press the button to write the next number into Drw. No. If that job has "
+            "had a number from you before, it offers to use the same one again.",
+            "Clashes lists any number used on two different jobs, so the same number never goes on two drawings.",
+        ],
+        "Saved Requests": [
+            "Every request made through New Request is kept here, newest first, with who it was given to from the schedule.",
+            "Search by job number, client, site or initials. Open one to see the full request and download it as a one-page PDF "
+            "request sheet (with the GeeTee logo) for the job file.",
+            "They're stored on a 'Requests Log' tab in the cad schedule, so nothing is lost when the app restarts. Don't edit that tab by hand.",
+        ],
+        "Find a Job": [
+            "Type a job number for its full history on the schedule, or a client / site name to search.",
+            "The Clarity folder path is shown to copy into Explorer. Run the app on an office PC and you get an Open folder button.",
+        ],
+    }
+    ADMIN_TOOLS = ["Weekly Report", "Drawing Numbers"]
+    TOOL_HELP["Weekly Report"] = "Hours, drawings and what's waiting"
+    TOOL_HOWTO["Weekly Report"] = [
+        "Admin only. Pick a week - it shows each tech's lines, jobs, hours logged vs available, days off, new drawing numbers and "
+        "any day over 8 hours, plus work by client.",
+        "Download it as a one-page A4 PDF with what's overdue, what's waiting for a CAD tech, urgent requests and new jobs.",
+        "Hours only count where the 'time' column has been filled in - the report says how many lines had hours.",
+    ]
+    names = [t for t in TOOL_HELP if is_admin() or t not in ADMIN_TOOLS]
+    if is_admin():
+        names = [t for t in names if t not in ADMIN_TOOLS] + ADMIN_TOOLS
+    tool = st.radio("Tool", names, horizontal=True, key="tool", label_visibility="collapsed", captions=[TOOL_HELP[t] for t in names])
+    if is_admin():
+        st.caption(":red[**Admin**] - you can see the weekly report, drawing numbers, delete and colour tools.")
+    with st.expander(f"How to use: {tool}", expanded=False):
+        for line in TOOL_HOWTO[tool]:
+            st.markdown(f"- {line}")
     try:
-        import json as _j
-        raw = str(_secret("gcp_json") or "")
-        robot = _j.loads(raw[raw.find("{"):raw.rfind("}") + 1]).get("client_email", "")
-    except Exception:
-        pass
-    if name in ("PermissionError", "SpreadsheetNotFound") or "403" in msg or "404" in msg:
-        st.error("The key works, but Google won't let the app into the cad schedule. Open the cad schedule > Share, add "
-                 f"**{robot or 'the client_email from the .json file'}** as an **Editor**, untick Notify, press Share - "
-                 "then refresh this page.")
-    elif "has not been used" in msg or "is disabled" in msg or "SERVICE_DISABLED" in msg:
-        st.error("The Google Sheets API isn't switched on for the key's project. In console.cloud.google.com search "
-                 "'Google Sheets API' > Enable (and 'Google Drive API' > Enable), wait a minute, then refresh.")
+        book()
+    except Exception as e:
+        msg, name = str(e).strip(), type(e).__name__
+        robot = ""
+        try:
+            import json as _j
+            raw = str(_secret("gcp_json") or "")
+            robot = _j.loads(raw[raw.find("{"):raw.rfind("}") + 1]).get("client_email", "")
+        except Exception:
+            pass
+        if name in ("PermissionError", "SpreadsheetNotFound") or "403" in msg or "404" in msg:
+            st.error("The key works, but Google won't let the app into the cad schedule. Open the cad schedule > Share, add "
+                     f"**{robot or 'the client_email from the .json file'}** as an **Editor**, untick Notify, press Share - "
+                     "then refresh this page.")
+        elif "has not been used" in msg or "is disabled" in msg or "SERVICE_DISABLED" in msg:
+            st.error("The Google Sheets API isn't switched on for the key's project. In console.cloud.google.com search "
+                     "'Google Sheets API' > Enable (and 'Google Drive API' > Enable), wait a minute, then refresh.")
+        else:
+            st.error(f"Can't open the cad schedule: {msg or name}")
+        st.stop()
+    if tool == "New Request":
+        new_request()
+    elif tool == "Unallocated Jobs":
+        unallocated()
+    elif tool == "Saved Requests":
+        saved_screen()
+    elif tool == "Weekly Report":
+        weekly_report()
+    elif tool == "Drawing Numbers":
+        drawing_numbers()
     else:
-        st.error(f"Can't open the cad schedule: {msg or name}")
-    st.stop()
-if tool == "New Request":
-    new_request()
-elif tool == "Unallocated Jobs":
-    unallocated()
-elif tool == "Saved Requests":
-    saved_screen()
-elif tool == "Weekly Report":
-    weekly_report()
-elif tool == "Drawing Numbers":
-    drawing_numbers()
-else:
-    find_job()
+        find_job()
 
-st.divider()
-if is_admin():
-    if st.button("Log out of admin", key="lo_admin"):
-        st.session_state["role"] = "team" if not pw else None
-        st.query_params.clear()
-        st.rerun()
+    st.divider()
+    if is_admin():
+        if st.button("Log out of admin", key="lo_admin"):
+            st.session_state["role"] = "team" if not pw else None
+            st.query_params.clear()
+            st.rerun()
