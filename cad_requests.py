@@ -349,7 +349,7 @@ def strip_done(values):
     return [list(r[1:]) for r in values] if has_done_col(values) else values
 
 
-PRIORITY_LIST = [str(i) for i in range(1, 13)]
+PRIORITY_LIST = ["URGENT"] + [str(i) for i in range(1, 13)] + ["ON HOLD"]
 
 
 class Tab:
