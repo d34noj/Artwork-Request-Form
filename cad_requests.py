@@ -381,8 +381,15 @@ class Tab:
     def acell(self, a1, **k):
         return self.w.acell(shift_a1(a1, self.off), **k)
 
-    def insert_row(self, row, index=1, **k):
-        return self.w.insert_row(([""] * self.off) + list(row), index=index, **k)
+    def insert_row(self, row, index=1, value_input_option="RAW", inherit_from_before=False, **k):
+        # gspread's insert_row writes with values.append, which looks for the "table" around the row and can
+        # drop the line one row lower than asked (seen on tabs with the Done column). Insert the blank row
+        # ourselves, then write to exactly that row.
+        self.w.spreadsheet.batch_update({"requests": [{"insertDimension": {
+            "range": {"sheetId": self.w.id, "dimension": "ROWS", "startIndex": index - 1, "endIndex": index},
+            "inheritFromBefore": bool(inherit_from_before and index > 1)}}]})
+        vals = ([""] * self.off) + list(row)
+        return self.w.update(range_name=f"A{index}", values=[vals], value_input_option=value_input_option)
 
     def col(self, i):
         """Real 0-based column index for a column of the old layout."""
