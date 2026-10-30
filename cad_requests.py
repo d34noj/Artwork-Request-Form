@@ -1020,9 +1020,12 @@ def _new_request():
     b1, b2, b3 = st.columns(3)
     hours = b1.number_input("Estimated CAD time (hours)", 0.0, 200.0, 0.0, 0.5, key="nr_hrs")
     need = b2.date_input("Required by", value=None, min_value=today - dt.timedelta(days=7), key="nr_need", format="DD/MM/YYYY")
-    day = b3.date_input("Day to draw it", value=today, key="nr_day", format="DD/MM/YYYY",
+    day = b3.date_input("Day to draw it", value=today, min_value=today, key="nr_day", format="DD/MM/YYYY",
                         help="Which day on the cad schedule this goes under - the day the CAD team should work on it. "
                              "Today unless you change it. 'Required by' is just the deadline.")
+    b3.caption(f"Goes on the schedule under **{day:%A %d %B}**")
+    if need and day > need:
+        b3.warning(f"That's after it's needed ({need:%a %d %b}).")
     details = st.text_area("What's needed", key="nr_details", height=90,
                            placeholder="e.g. Amend wayfinding package in line with client comments received today")
     try:
@@ -1049,6 +1052,9 @@ def _new_request():
     notes = details.strip()
     missing = [n for n, v in (("job no. or site", job or site), ("client", client), ("your initials", pm), ("what's needed", details))
                if not str(v).strip()]
+    if day < today:                       # e.g. typing 02 over 30/10 leaves October - never book into the past
+        st.error(f"'Day to draw it' is {day:%a %d %b %Y}, which has already gone - pick the right month.")
+        missing.append("day to draw it")
     if st.button("Submit request", type="primary", key="nr_go", disabled=bool(missing) or st.session_state.get("nr_sending", False)):
         st.session_state["nr_sending"] = True
         st.session_state.pop("nr_note_err", None)
