@@ -1024,15 +1024,17 @@ def _new_request():
     client = a1.text_input("Client", value=prev["Client"] if prev else "", key=f"nr_client_{k}")
     site = a2.text_input("Site / project", value=prev["Site"] if prev else "", key=f"nr_site_{k}")
     pm = a3.text_input("Requested by (your initials)", value=prev["PM"] if prev else "", key=f"nr_pm_{k}", max_chars=4)
-    b1, b2, b3 = st.columns(3)
+    b1, b2 = st.columns(2)
     hours = b1.number_input("Estimated CAD time (hours)", 0.0, 200.0, 0.0, 0.5, key="nr_hrs")
-    need = b2.date_input("Required by", value=None, min_value=today - dt.timedelta(days=7), key="nr_need", format="DD/MM/YYYY")
-    day = b3.date_input("Day to draw it", value=today, min_value=today, key="nr_day", format="DD/MM/YYYY",
-                        help="Which day on the cad schedule this goes under - the day the CAD team should work on it. "
-                             "Today unless you change it. 'Required by' is just the deadline.")
-    b3.caption(f"Goes on the schedule under **{day:%A %d %B}**")
-    if need and day > need:
-        b3.warning(f"That's after it's needed ({need:%a %d %b}).")
+    need = b2.date_input("Required by", value=today, min_value=today, key="nr_need", format="DD/MM/YYYY",
+                         help="The day it's needed. It goes on the cad schedule under this day "
+                              "(a Saturday or Sunday goes on the Friday before).")
+    day = need or today
+    while day.weekday() >= 5 and day > today:     # weekend -> the Friday before
+        day -= dt.timedelta(days=1)
+    if day.weekday() >= 5:                         # it's the weekend today -> Monday
+        day += dt.timedelta(days=7 - day.weekday())
+    b2.caption(f"Goes on the schedule under **{day:%A %d %B}**")
     details = st.text_area("What's needed", key="nr_details", height=90,
                            placeholder="e.g. Amend wayfinding package in line with client comments received today")
     try:
@@ -1059,9 +1061,9 @@ def _new_request():
     notes = details.strip()
     missing = [n for n, v in (("job no. or site", job or site), ("client", client), ("your initials", pm), ("what's needed", details))
                if not str(v).strip()]
-    if day < today:                       # e.g. typing 02 over 30/10 leaves October - never book into the past
-        st.error(f"'Day to draw it' is {day:%a %d %b %Y}, which has already gone - pick the right month.")
-        missing.append("day to draw it")
+    if need and need < today:              # e.g. typing 02 over 30/10 leaves October - never book into the past
+        st.error(f"'Required by' is {need:%a %d %b %Y}, which has already gone - check the month.")
+        missing.append("required by")
     if st.button("Submit request", type="primary", key="nr_go", disabled=bool(missing) or st.session_state.get("nr_sending", False)):
         st.session_state["nr_sending"] = True
         st.session_state.pop("nr_note_err", None)
@@ -1610,7 +1612,7 @@ if __name__ == "__main__":
             "Add the estimated hours, the date you need it by and what's needed, then press Submit request.",
             "Pick who's drawing it (DJ / DM / JA) if you know - each shows their free hours that day out of 8. If they're full, it "
             "offers their next free day. Leave it on 'Not decided' and it goes on Unallocated Jobs for the CAD team.",
-            "It goes into this month's tab under the date you pick (today unless you change it), at the bottom of that day, "
+            "It goes on the schedule under the 'Required by' date (a weekend goes on the Friday before), at the bottom of that day, "
             "with Drw. by left blank. Tick URGENT and the whole line goes in red.",
             "No job number yet? Leave it blank and fill in the site instead.",
         ],
