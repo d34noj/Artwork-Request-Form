@@ -169,7 +169,7 @@ def where_to_put(values, d):
     return i + 1, True                            # insert here, everything below moves down
 
 
-def plan_slot(values, boxed, d):
+def plan_slot(values, boxed, d, tech=""):
     """Where a new line goes under date d, using the day's boxes (boxed = 1-based rows whose Client cell has borders).
     - an empty boxed line under that date -> fill it
     - otherwise -> insert a new line straight after the day's last boxed line (above the hours total box),
@@ -188,6 +188,11 @@ def plan_slot(values, boxed, d):
     for i in jobs:
         if is_blank(pad(values[i])[1:C_DWG + 1]):
             return {"at": i + 1, "insert": False, "fmt_src": None, "total_row": None, "first": jobs[0] + 1}
+    if tech:                                       # the day's empty line for that tech (e.g. the blank 'DJ' line)
+        for i in range(h + 1, end):
+            r = pad(values[i])
+            if r[C_DRAWN].strip().upper() == tech.upper() and is_blank([x for k, x in enumerate(r[1:C_DWG + 1], 1) if k != C_DRAWN]):
+                return {"at": i + 1, "insert": False, "fmt_src": None, "total_row": None, "first": jobs[0] + 1}
     last = max(jobs)
     total = last + 1 if last + 1 < end and (last + 2) not in boxed and not is_job_row(values[last + 1]) else None
     return {"at": last + 2, "insert": True, "fmt_src": last + 1, "total_row": (total + 2) if total is not None else None,
@@ -452,7 +457,7 @@ def add_request(d, row, urgent=False, note=""):
         day = d + dt.timedelta(days=k)
         if day.month != d.month:
             break
-        plan = plan_slot(values, boxed, day)
+        plan = plan_slot(values, boxed, day, row[C_DRAWN] if len(row) > C_DRAWN else "")
         if plan is not None:
             break
     if plan is None:
