@@ -66,7 +66,8 @@ def _secret(key, default=None):
 
 SHEET_ID = _secret("sheet_id", "17yQp7muhaHA1LWMVrTfEpBiYvFyklW3VD115kUc5GfM")
 CLARITY_ROOT = _secret("clarity_root", r"Z:\Clarity Job Documents")
-CAD_TEAM = list(_secret("cad_team", ["DJ", "DM", "JA"]))
+CAD_LEFT = {str(t).strip().upper() for t in _secret("cad_left", ["DM"])}   # techs who've left - kept in old tabs, not offered
+CAD_TEAM = [t for t in _secret("cad_team", ["DJ", "JA"]) if str(t).strip().upper() not in CAD_LEFT]
 # Where a client's Clarity folder isn't named the same as on the schedule, e.g. {"Five Guys JV" = "Five Guys"}
 CLIENT_FOLDERS = dict(_secret("client_folders", {}))
 DAY_HOURS = float(_secret("day_hours", 8))
@@ -1356,7 +1357,7 @@ def week_stats(hist, reqs, mon, today):
     """Everything for the week Mon..Fri starting 'mon'."""
     fri = mon + dt.timedelta(days=4)
     wk = [h for h in hist if mon <= h["Date"] <= fri]
-    techs = list(CAD_TEAM)
+    techs = list(CAD_TEAM) + sorted({h["Drw. by"].upper() for h in wk} & CAD_LEFT)   # past weeks still show leavers
     work = [h for h in wk if h["Drw. by"].upper() in techs]
     # days off / holidays from the schedule (needs the raw tabs - taken from history notes isn't possible, so use tech_load)
     tabs = month_tabs(mon)
@@ -1610,7 +1611,7 @@ if __name__ == "__main__":
         "New Request": [
             "Type the Clarity job number. If it's been on the schedule before, the client, site and PM fill themselves in.",
             "Add the estimated hours, the date you need it by and what's needed, then press Submit request.",
-            "Pick who's drawing it (DJ / DM / JA) if you know - each shows their free hours that day out of 8. If they're full, it "
+            "Pick who's drawing it (DJ / JA) if you know - each shows their free hours that day out of 8. If they're full, it "
             "offers their next free day. Leave it on 'Not decided' and it goes on Unallocated Jobs for the CAD team.",
             "It goes on the schedule under the 'Required by' date (a weekend goes on the Friday before), at the bottom of that day, "
             "with Drw. by left blank. Tick URGENT and the whole line goes in red.",
@@ -1622,7 +1623,7 @@ if __name__ == "__main__":
             "The CAD time table shows each tech's booked hours per day out of 8 (holidays like 'JAY HOLIDAY' count as off).",
             "When you give a job out, it checks the tech still has room that day. If not, it shows the next day they're free and "
             "(ticked by default) moves the line to that day when you Save.",
-            "Lines are filled in each tech's colour (DJ grey, DM blue, JA pink). 'Colour this month's schedule' does the whole tab "
+            "Lines are filled in each tech's colour (DJ grey, JA pink). 'Colour this month's schedule' does the whole tab "
             "in one go for lines given out by hand.",
             "Tick 'Delete' to take a line off the schedule (it asks you to confirm). If it's the only job under that date, the box is "
             "just emptied so the day keeps its layout. The request stays in Saved Requests, marked as deleted.",
@@ -1630,7 +1631,7 @@ if __name__ == "__main__":
         ],
         "Drawing Numbers": [
             "Shows the next drawing number for each tech, worked out from the Drw. No. column on the schedule.",
-            "It follows each tech's current run - when the numbers start again (e.g. DM248 then DM02) it counts from the restart.",
+            "It follows each tech's current run - when the numbers start again (e.g. DJ248 then DJ02) it counts from the restart.",
             "Pick a line that hasn't got a number yet and press the button to write the next number into Drw. No. If that job has "
             "had a number from you before, it offers to use the same one again.",
             "Clashes lists any number used on two different jobs, so the same number never goes on two drawings.",
