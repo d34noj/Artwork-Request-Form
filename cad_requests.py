@@ -515,8 +515,61 @@ def add_request(d, row, urgent=False, note=""):
             w.clear_done(at)
     except Exception:
         pass
+    if urgent and getattr(w, "off", 0):         # priority dropdown (B) = URGENT on tabs with the Done column
+        try:
+            w.update(range_name=f"A{at}", values=[["URGENT"]], value_input_option="USER_ENTERED")
+        except Exception:
+            pass
     fix_day_total(w, day)
+    try:
+        at = sort_tech_lines(w, day, row[C_DRAWN] if len(row) > C_DRAWN else "", at)
+    except Exception:
+        pass
     return w.title, at, day
+
+
+def pri_key(p):
+    """Order of a day's lines: URGENT, 1, 2, 3 ..., no priority, ON HOLD."""
+    s = str(p or "").strip().upper()
+    if s == "URGENT":
+        return 0
+    if s == "ON HOLD":
+        return 999
+    try:
+        return float(s)
+    except ValueError:
+        return 500
+
+
+def sort_tech_lines(w, d, tech, track=None):
+    """Put one tech's lines under day d in order: not done first (URGENT, 1, 2 ... blank, ON HOLD), ticked Done last.
+    Whole rows are moved, so colours, ticks, notes and dropdowns go with them. Returns where row `track` ended up."""
+    if not tech or not getattr(w, "off", 0):
+        return track
+    raw = w.w.get_all_values()
+    values = [list(r[1:]) for r in raw]
+    blk = next(((h, e) for dd, h, e in day_blocks(values, d.replace(day=1)) if dd == d), None)
+    if not blk:
+        return track
+    h, e = blk
+    mine = [i for i in range(h + 1, e) if is_job_row(values[i]) and pad(values[i])[C_DRAWN].strip().upper() == tech.upper()]
+    if len(mine) < 2 or mine != list(range(mine[0], mine[-1] + 1)):
+        return track                              # only sort when that tech's lines sit together
+    done = lambda i: str(raw[i][0]).strip().upper() == "TRUE"
+    want = sorted(mine, key=lambda i: (done(i), pri_key(values[i][0]), i))
+    if want == mine:
+        return track
+    order, start, reqs = list(mine), mine[0], []
+    for k, src in enumerate(want):                # move each line up into place, top to bottom
+        cur = order.index(src)
+        if cur != k:
+            reqs.append({"moveDimension": {"source": {"sheetId": w.id, "dimension": "ROWS", "startIndex": start + cur,
+                                                      "endIndex": start + cur + 1}, "destinationIndex": start + k}})
+            order.insert(k, order.pop(cur))
+    w.spreadsheet.batch_update({"requests": reqs})
+    if track and (track - 1) in want:
+        return start + want.index(track - 1) + 1
+    return track
 
 
 # --------------------------------------------------------------------------------------
