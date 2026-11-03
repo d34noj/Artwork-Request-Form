@@ -199,7 +199,12 @@ def plan_slot(values, boxed, d, tech=""):
                 return {"at": i + 1, "insert": False, "fmt_src": None, "total_row": None, "first": jobs[0] + 1}
     last = max(jobs)
     total = last + 1 if last + 1 < end and (last + 2) not in boxed and not is_job_row(values[last + 1]) else None
-    return {"at": last + 2, "insert": True, "fmt_src": last + 1, "total_row": (total + 2) if total is not None else None,
+    after = last
+    if tech:                                       # keep each tech's lines together: go under that tech's last line
+        mine = [i for i in jobs if pad(values[i])[C_DRAWN].strip().upper() == tech.upper()]
+        if mine:
+            after = max(mine)
+    return {"at": after + 2, "insert": True, "fmt_src": after + 1, "total_row": (total + 2) if total is not None else None,
             "first": jobs[0] + 1}
 
 
