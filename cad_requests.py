@@ -32,6 +32,8 @@ def page_style():
     logo = ""
     if os.path.exists(LOGO):
         logo = base64.b64encode(open(LOGO, "rb").read()).decode()
+    k = st.query_params.get("k")                     # keep the login when the logo sends you home
+    home = f"?k={k}" if k else "?"
     st.markdown(f"""
 <style>
   #MainMenu, footer, [data-testid="stToolbar"], [data-testid="stHeader"], [data-testid="stDecoration"] {{ display: none; }}
@@ -39,6 +41,8 @@ def page_style():
   .gt-head {{ display: flex; align-items: center; gap: 22px; padding: 14px 4px 16px; border-bottom: 3px solid {BRAND};
               margin-bottom: 18px; }}
   .gt-head img {{ height: 64px; width: auto; }}
+  .gt-head a.gt-home {{ display: block; line-height: 0; border-radius: 6px; transition: opacity .15s, transform .15s; }}
+  .gt-head a.gt-home:hover {{ opacity: .8; transform: scale(.97); }}
   .gt-head h1 {{ font-size: 1.85rem; font-weight: 700; margin: 0; padding: 0; letter-spacing: -0.01em; line-height: 1.15; }}
   .gt-head p {{ margin: 3px 0 0; opacity: .65; font-size: .95rem; }}
   .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {{
@@ -50,7 +54,7 @@ def page_style():
   [data-testid="stCaptionContainer"] {{ opacity: .8; }}
 </style>
 <div class="gt-head">
-  {f'<img src="data:image/png;base64,{logo}" alt="GeeTee">' if logo else ''}
+  {f'<a class="gt-home" href="{home}" target="_self" title="Back to the start"><img src="data:image/png;base64,{logo}" alt="GeeTee"></a>' if logo else ''}
   <div><h1>CAD Requests</h1><p>Artwork requests straight onto the cad schedule</p></div>
 </div>""", unsafe_allow_html=True)
 
