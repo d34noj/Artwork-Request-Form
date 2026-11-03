@@ -520,11 +520,11 @@ def add_request(d, row, urgent=False, note=""):
             w.update(range_name=f"A{at}", values=[["URGENT"]], value_input_option="USER_ENTERED")
         except Exception:
             pass
-    fix_day_total(w, day)
     try:
         at = sort_tech_lines(w, day, row[C_DRAWN] if len(row) > C_DRAWN else "", at)
     except Exception:
         pass
+    fix_day_total(w, day)                    # after sorting - moving the day's first line shifts the SUM's start
     return w.title, at, day
 
 
