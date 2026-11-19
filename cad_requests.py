@@ -3,6 +3,7 @@ CAD Requests - the front door to the cad schedule (Google Sheet).
 
   New Request      PM fills in a short form -> a row goes into this month's tab under the date, Drw. by left blank
   Unallocated Jobs everything with no CAD tech yet -> pick who gets it, press Save
+  Change CAD Tech  a job already given out -> pick someone else, press Save (same day, moves into their lines)
   Find a Job       every time a job number has been on the schedule, plus its Clarity folder
 
 Needs (requirements.txt): streamlit, gspread, google-auth, pandas
@@ -837,6 +838,137 @@ def allocate(items):
 
 
 # --------------------------------------------------------------------------------------
+# Change CAD tech: hand a job that's already been given out to someone else
+# --------------------------------------------------------------------------------------
+def is_tech_blank(row):
+    """The day's empty line for a tech: Drw. by filled in (e.g. 'JA') and nothing else in B-I."""
+    r = pad(row)
+    return bool(r[C_DRAWN].strip()) and is_blank([x for k, x in enumerate(r[1:C_DWG + 1], 1) if k != C_DRAWN])
+
+
+def find_assigned(values, row, job, site, tech):
+    """Row (1-based) of a job line given to tech - where it was, or the nearest match if lines have moved."""
+    match = lambda x: pad(x)[C_JOB].strip() == job and pad(x)[C_SITE].strip() == site \
+        and pad(x)[C_DRAWN].strip().upper() == tech.upper()
+    if 0 < row <= len(values) and match(values[row - 1]):
+        return row
+    hits = [i + 1 for i, x in enumerate(values) if is_job_row(x) and match(x)]
+    return min(hits, key=lambda i: abs(i - row)) if hits else None
+
+
+def tech_rank(t):
+    t = str(t).strip().upper()
+    return CAD_TEAM.index(t) if t in CAD_TEAM else (len(CAD_TEAM) if t else len(CAD_TEAM) + 1)
+
+
+def group_plan(values, h, e):
+    """A day's lines (job lines and the techs' empty lines) put back into tech order - DJ's together, then JA's -
+    keeping each tech's own order. Returns (rows, want) as 0-based indexes, or None if the lines aren't together
+    (e.g. a holiday line in the middle), in which case nothing is moved."""
+    rows = [i for i in range(h + 1, e) if is_job_row(values[i]) or is_tech_blank(values[i])]
+    if len(rows) < 2 or rows != list(range(rows[0], rows[-1] + 1)):
+        return None
+    want = sorted(rows, key=lambda i: (tech_rank(pad(values[i])[C_DRAWN]), i))
+    return rows, want
+
+
+def move_rows(w, rows, want, track=None):
+    """Reorder a run of whole rows (0-based, together) into 'want' order. Returns where 0-based row `track` ended up."""
+    if want == rows:
+        return track
+    order, start, reqs = list(rows), rows[0], []
+    for k, src in enumerate(want):
+        cur = order.index(src)
+        if cur != k:
+            reqs.append({"moveDimension": {"source": {"sheetId": w.id, "dimension": "ROWS", "startIndex": start + cur,
+                                                      "endIndex": start + cur + 1}, "destinationIndex": start + k}})
+            order.insert(k, order.pop(cur))
+    w.spreadsheet.batch_update({"requests": reqs})
+    return start + want.index(track) if track in want else track
+
+
+def change_tech(tab, row, job, site, old, new):
+    """Give a line that's already with 'old' to 'new' on the same day. The whole row moves into the new tech's
+    lines, so its Done tick, priority, Started? dropdown, URGENT red and note all go with it.
+    Returns (day, row) or None if the line can't be found any more."""
+    w = ws(tab)
+    month = tab_month(tab)
+    values = w.get_all_values()
+    t = find_assigned(values, row, job, site, old)
+    if t is None:
+        return None
+    blk = next(((d, h, e) for d, h, e in day_blocks(values, month) if h < t - 1 < e), None)
+    w.update(range_name=f"G{t}", values=[[new]])
+    try:
+        colour_rows(w, {t: new})
+    except Exception:
+        pass
+    if not blk:
+        return None, t
+    d, h, e = blk
+    values[t - 1] = pad(values[t - 1])
+    values[t - 1][C_DRAWN] = new
+    # The new tech's empty line that day: hand it to the old tech if they've now got nothing that day, else remove it
+    blank = next((i for i in range(h + 1, e) if i != t - 1 and is_tech_blank(values[i])
+                  and pad(values[i])[C_DRAWN].strip().upper() == new.upper()), None)
+    if blank is not None:
+        old_left = any(i != t - 1 and pad(values[i])[C_DRAWN].strip().upper() == old.upper() for i in range(h + 1, e))
+        try:
+            if old_left:
+                w.delete_rows(blank + 1)
+                if blank < t - 1:
+                    t -= 1
+            else:
+                w.update(range_name=f"G{blank + 1}", values=[[old]])
+                colour_rows(w, {blank + 1: old})
+        except Exception:
+            pass
+        values = w.get_all_values()
+        blk = next(((dd, hh, ee) for dd, hh, ee in day_blocks(values, month) if dd == d), None)
+        if not blk:
+            return d, t
+        _, h, e = blk
+    try:                                       # keep each tech's lines together, then sort the new tech's by priority
+        plan = group_plan(values, h, e)
+        if plan:
+            t = move_rows(w, *plan, track=t - 1) + 1
+        t = sort_tech_lines(w, d, new, t)
+    except Exception:
+        pass
+    fix_day_total(w, d)
+    return d, t
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def given_out(today, back_days=0):
+    """Job lines with a CAD tech that aren't ticked Done, from (today - back_days) on."""
+    out = []
+    since = today - dt.timedelta(days=back_days)
+    m = today.replace(day=1)
+    for mm in ((m - dt.timedelta(days=1)).replace(day=1), m, (m + dt.timedelta(days=32)).replace(day=1)):
+        w = ws(tab_name(mm))
+        if w is None:
+            continue
+        raw = w.w.get_all_values() if isinstance(w, Tab) else w.get_all_values()
+        off = getattr(w, "off", 0)
+        values = [list(r[off:]) for r in raw]
+        for d, h, e in day_blocks(values, tab_month(w.title)):
+            if d < since:
+                continue
+            for i in range(h + 1, e):
+                r = pad(values[i])
+                tech = r[C_DRAWN].strip().upper()
+                if not (is_job_row(r) and tech):
+                    continue
+                if off and str(raw[i][0]).strip().upper() == "TRUE":
+                    continue                       # ticked Done
+                out.append({"Tab": w.title, "Row": i + 1, "Date": d, "Pri": r[0].strip(), "Job": r[C_JOB].strip(),
+                            "Client": r[C_CLIENT].strip(), "Site": r[C_SITE].strip(), "PM": r[C_PM].strip(),
+                            "Hrs": r[C_TIME].strip(), "Drw. by": tech, "Notes": r[C_NOTES].strip()})
+    return out
+
+
+# --------------------------------------------------------------------------------------
 # Saved requests: every request is also kept on a 'Requests Log' tab (the schedule rows get edited and moved,
 # the log never changes), and any of them can be downloaded as a one-page request sheet.
 # --------------------------------------------------------------------------------------
@@ -1580,6 +1712,81 @@ def weekly_report():
                f"{sum(S['per'][t]['Lines with hours'] for t in techs)} of {S['lines']} lines had hours on them.")
 
 
+def change_tech_screen():
+    today = dt.date.today()
+    c1, c2, c3 = st.columns([2, 1, 1])
+    past = c2.toggle("Show the last 2 weeks too", key="ct_past")
+    if c3.button("Refresh", key="ct_ref", use_container_width=True):
+        given_out.clear()
+        st.rerun()
+    rows = given_out(today, 14 if past else 0)
+    if not rows:
+        st.info("No jobs given out from today on that aren't ticked Done.")
+        return
+    q = c1.text_input("Search", key="ct_q", placeholder="Job no., client, site, initials...").strip().lower()
+    if q:
+        rows = [r for r in rows if any(q in str(r[k]).lower() for k in ("Job", "Client", "Site", "PM", "Drw. by", "Notes"))]
+    if not rows:
+        st.warning("Nothing matches that.")
+        return
+    df = pd.DataFrame(rows)
+    df["Day"] = df["Date"].apply(lambda d: f"{d:%a %d-%b}")
+    df.insert(0, "Change to", None)
+    cols = ["Change to", "Day", "Drw. by", "Pri", "Job", "Client", "Site", "PM", "Hrs", "Notes", "Tab", "Row"]
+    ed = st.data_editor(df[cols], hide_index=True, use_container_width=True, key=f"ct_ed_{st.session_state.get('ct_n', 0)}",
+                        column_config={"Change to": st.column_config.SelectboxColumn("Change to", options=CAD_TEAM, width="small"),
+                                       "Drw. by": st.column_config.TextColumn("Now with", width="small"),
+                                       "Tab": None, "Row": None},
+                        disabled=[c for c in cols if c != "Change to"])
+    ed["Date"] = df["Date"]
+    picks = ed[ed["Change to"].notna() & (ed["Change to"].astype(str).str.upper() != ed["Drw. by"].astype(str).str.upper())]
+    if picks.empty:
+        st.caption("Pick a name in 'Change to' for any line, then press Save.")
+        return
+    booked, off, _ = load_snapshot(today)
+    sim, chk = dict(booked), []
+    for _, r in picks.iterrows():
+        d, old, new, hrs = r["Date"], r["Drw. by"], r["Change to"], hours_of(r["Hrs"])
+        sim[(d, old)] = sim.get((d, old), 0.0) - hrs
+        sim[(d, new)] = sim.get((d, new), 0.0) + hrs
+        if (d, new) in off:
+            res = f"{new} is off that day"
+        elif sim[(d, new)] > DAY_HOURS:
+            res = f"{new} would be on {sim[(d, new)]:g}h that day (over {DAY_HOURS:g})"
+        else:
+            res = f"OK - {new} on {sim[(d, new)]:g}h that day"
+        chk.append({"Job": r["Job"], "Site": r["Site"], "Day": r["Day"], "From": old, "To": new, "Hrs": r["Hrs"], "Check": res})
+    st.dataframe(pd.DataFrame(chk), hide_index=True, use_container_width=True)
+    if st.button(f"Save ({len(picks)})", type="primary", key="ct_save"):
+        msgs, skipped = [], []
+        for _, r in picks.iterrows():
+            try:
+                res = change_tech(r["Tab"], int(r["Row"]), r["Job"], r["Site"], r["Drw. by"], r["Change to"])
+            except Exception as e:
+                res = None
+                skipped.append(f"{r['Job']} {r['Site']} ({e})")
+                continue
+            if res is None:
+                skipped.append(f"{r['Job']} {r['Site']}")
+            else:
+                msgs.append(f"{r['Job']} {r['Site']} ({r['Day']}): {r['Drw. by']} -> {r['Change to']}")
+        given_out.clear()
+        all_history.clear()
+        load_snapshot.clear()
+        st.session_state["ct_n"] = st.session_state.get("ct_n", 0) + 1     # fresh table after saving
+        st.session_state["ct_msg"] = (msgs, skipped)
+        st.rerun()
+
+
+def change_tech_page():
+    msgs, skipped = st.session_state.pop("ct_msg", ([], []))
+    if msgs:
+        st.success("Changed: " + "; ".join(msgs))
+    if skipped:
+        st.warning("Couldn't change these (moved, changed or deleted since) - press Refresh and try again: " + "; ".join(skipped))
+    change_tech_screen()
+
+
 def find_job():
     q = st.text_input("Job number, client or site", key="fj_q", placeholder="14973, Next, Braintree...").strip()
     if re.fullmatch(r"[Cc]\s*-?\s*\d{4,6}", q):
@@ -1670,6 +1877,7 @@ if __name__ == "__main__":
     TOOL_HELP = {
         "New Request": "Ask the CAD team for artwork",
         "Unallocated Jobs": "Give waiting jobs to a CAD tech",
+        "Change CAD Tech": "Move a job to a different CAD tech",
         "Find a Job": "Job history and Clarity folder",
         "Saved Requests": "Every request made, for reference",
         "Drawing Numbers": "Next number per tech, and clashes",
@@ -1695,6 +1903,16 @@ if __name__ == "__main__":
             "Tick 'Delete' to take a line off the schedule (it asks you to confirm). If it's the only job under that date, the box is "
             "just emptied so the day keeps its layout. The request stays in Saved Requests, marked as deleted.",
             "If someone's added lines since you opened the page, it finds the job again before writing, so nothing lands on the wrong row.",
+        ],
+        "Change CAD Tech": [
+            "Lists every line that's already been given to a CAD tech, from today on, that isn't ticked Done. "
+            "Switch on 'Show the last 2 weeks too' for older lines.",
+            "Pick the new name in 'Change to' for as many lines as you like, check the hours, then press Save.",
+            "The line stays on the same day. It moves down into the new tech's lines and is re-coloured, keeping its "
+            "Done tick, priority, URGENT red and note. The day's hours total is redone.",
+            "If the new tech only had their empty line that day, the job takes its place (or the empty line goes to the "
+            "old tech if they've now got nothing that day).",
+            "The check warns if it puts the new tech over 8 hours or on a day off, but it still lets you save.",
         ],
         "Drawing Numbers": [
             "Shows the next drawing number for each tech, worked out from the Drw. No. column on the schedule.",
@@ -1756,6 +1974,8 @@ if __name__ == "__main__":
         new_request()
     elif tool == "Unallocated Jobs":
         unallocated()
+    elif tool == "Change CAD Tech":
+        change_tech_page()
     elif tool == "Saved Requests":
         saved_screen()
     elif tool == "Weekly Report":
