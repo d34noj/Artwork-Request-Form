@@ -4,7 +4,7 @@ CAD Requests - the front door to the cad schedule (Google Sheet).
   New Request      PM fills in a short form -> a row goes into this month's tab under the date, Drw. by left blank
   Unallocated Jobs everything with no CAD tech yet -> pick who gets it, press Save
   Edit Schedule    a job already given out -> move it to another day and/or give it to someone else, press Save
-  Holidays         month calendar of who's off; admin books / cancels holidays (red 'JAY HOLIDAY' lines on the schedule)
+  Holidays         month calendar of who's off; admin books / cancels holidays (red 'JAY HOLIDAY' lines on the schedule only)
   Find a Job       every time a job number has been on the schedule, plus its Clarity folder
 
 Needs (requirements.txt): streamlit, gspread, google-auth, pandas
@@ -712,19 +712,9 @@ def month_tabs(around):
     return out
 
 
-def with_booked_holidays(load):
-    """Add holidays from the Holidays tab (incl. months whose tab isn't made yet) to tech_load's 'off' set."""
-    booked, off, days = load
-    try:
-        off = set(off) | {(h["Date"], h["Tech"]) for h in holidays_booked()}
-    except Exception:
-        pass
-    return booked, off, days
-
-
 @st.cache_data(ttl=60, show_spinner=False)
 def load_snapshot(today):
-    return with_booked_holidays(tech_load(month_tabs(today)))
+    return tech_load(month_tabs(today))
 
 
 def move_job(tab, row, job, site, notes, tech, day):
@@ -1054,11 +1044,9 @@ def move_assigned(tab, row, job, site, old, new, day):
 
 
 # --------------------------------------------------------------------------------------
-# Holidays: a 'Holidays' tab keeps every booked day (so months that haven't got a tab yet still count), and each
-# day gets a red 'JAY HOLIDAY' line on the schedule under its date as soon as that month's tab exists.
+# Holidays: a red 'JAY HOLIDAY' line (white text) under the date on the schedule. That line is the only record -
+# the app reads it back (tech_load) to count the tech as off.
 # --------------------------------------------------------------------------------------
-HOL_TAB = "Holidays"
-HOL_COLS = ["Tech", "Date", "Booked", "On schedule"]
 HOL_RED = {"red": 0.85, "green": 0.11, "blue": 0.11}
 WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
 
@@ -1076,41 +1064,6 @@ def is_holiday_line(row, tech=None):
     if tech is None:
         return True
     return any(n in text for n in CAD_NAMES.get(tech.upper(), [tech.upper()]))
-
-
-def hol_ws(create=False):
-    for w in book().worksheets():
-        if w.title.strip().lower() == HOL_TAB.lower():
-            return w
-    if not create:
-        return None
-    w = book().add_worksheet(HOL_TAB, rows=400, cols=len(HOL_COLS))
-    w.update(range_name="A1", values=[HOL_COLS])
-    return w
-
-
-def parse_day(s):
-    for f in ("%d/%m/%Y", "%Y-%m-%d", "%d/%m/%y"):
-        try:
-            return dt.datetime.strptime(str(s).strip(), f).date()
-        except ValueError:
-            pass
-    return None
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def holidays_booked():
-    """Every day on the Holidays tab: [{Tech, Date, Row, On schedule}]."""
-    w = hol_ws()
-    if w is None:
-        return []
-    out = []
-    for i, r in enumerate(w.get_all_values()[1:], 2):
-        r = pad(r, len(HOL_COLS))
-        d, t = parse_day(r[1]), r[0].strip().upper()
-        if d and t:
-            out.append({"Tech": t, "Date": d, "Row": i, "On schedule": r[3].strip()})
-    return out
 
 
 def put_holiday_line(d, tech):
@@ -1178,51 +1131,15 @@ def working_days(a, b):
 
 
 def book_holiday(tech, a, b):
-    """Book tech off every weekday from a to b. Returns {day: result}."""
-    w = hol_ws(create=True)
-    have = {(h["Tech"], h["Date"]) for h in holidays_booked()}
-    out, new = {}, []
-    for d in working_days(a, b):
-        res = put_holiday_line(d, tech)
-        out[d] = res
-        if (tech, d) not in have:
-            mark = {"added": "Yes", "there": "Yes", "no date": "No date"}.get(res, "")
-            new.append([tech, f"{d:%d/%m/%Y}", f"{uk_now():%d/%m/%Y %H:%M}", mark])
-    if new:
-        w.append_rows(new, value_input_option="RAW")
-    holidays_booked.clear()
+    """Red holiday line for tech on every weekday from a to b. Returns {day: 'added' / 'there' / 'no tab' / 'no date'}."""
+    out = {d: put_holiday_line(d, tech) for d in working_days(a, b)}
     load_snapshot.clear()
     return out
 
 
 def cancel_holiday(tech, d):
-    w = hol_ws()
-    if w is not None:
-        rows = [h["Row"] for h in holidays_booked() if h["Tech"] == tech and h["Date"] == d]
-        for r in sorted(rows, reverse=True):
-            w.delete_rows(r)
     take_holiday_line(d, tech)
-    holidays_booked.clear()
     load_snapshot.clear()
-
-
-def sync_holidays():
-    """Holidays booked for a month that had no tab yet: put their lines on now the tab's there."""
-    w = hol_ws()
-    if w is None:
-        return 0
-    n, today = 0, dt.date.today()
-    for h in holidays_booked():
-        if h["On schedule"] or h["Date"] < today - dt.timedelta(days=7):
-            continue
-        res = put_holiday_line(h["Date"], h["Tech"])
-        if res in ("added", "there", "no date"):
-            w.update(range_name=f"D{h['Row']}", values=[["Yes" if res != "no date" else "No date"]])
-            n += res == "added"
-    if n:
-        holidays_booked.clear()
-        load_snapshot.clear()
-    return n
 
 
 # --------------------------------------------------------------------------------------
@@ -1584,7 +1501,7 @@ def availability_table(booked, off, days, start, n=10):
 def unallocated():
     today = dt.date.today()
     tabs = month_tabs(today)
-    booked, off, days = with_booked_holidays(tech_load(tabs))
+    booked, off, days = tech_load(tabs)
     rows = []
     prev_t, cur_t = tab_name((today.replace(day=1) - dt.timedelta(days=1))), tab_name(today)
     for t, v in tabs.items():
@@ -2072,11 +1989,8 @@ def edit_schedule_page():
 
 
 def holiday_days(start, end):
-    """{(day, tech)} off between start and end - booked on the Holidays tab or typed on the schedule."""
-    try:
-        _, off, _ = load_snapshot(dt.date.today())
-    except Exception:
-        off = {(h["Date"], h["Tech"]) for h in holidays_booked()}
+    """{(day, tech)} off between start and end - from the holiday lines on last / this / next month's tabs."""
+    _, off, _ = load_snapshot(dt.date.today())
     return {(d, t) for d, t in off if start <= d <= end}
 
 
@@ -2127,7 +2041,6 @@ def holidays_screen():
         st.session_state["hol_m"] = k + 1
         st.rerun()
     if c4.button("Refresh", key="hol_ref", use_container_width=True):
-        holidays_booked.clear()
         load_snapshot.clear()
         st.rerun()
     end = (month + dt.timedelta(days=32)).replace(day=1) - dt.timedelta(days=1)
@@ -2155,9 +2068,9 @@ def holidays_screen():
             on = sum(1 for v in res.values() if v in ("added", "there"))
             later = sum(1 for v in res.values() if v == "no tab")
             nodate = [d for d, v in res.items() if v == "no date"]
-            txt = f"{hol_text(tech)} booked for {len(res)} day(s). {on} on the schedule now."
+            txt = f"{hol_text(tech)} on the schedule for {on} day(s)."
             if later:
-                txt += f" {later} day(s) are in a month with no tab yet - they go on automatically once the tab's made."
+                txt += f" {later} day(s) are in a month with no tab yet - book those once the tab's made."
             if nodate:
                 txt += " No date heading on the schedule for " + ", ".join(f"{d:%a %d-%b}" for d in nodate) + " (bank holiday?)."
             given_out.clear()
@@ -2323,8 +2236,8 @@ if __name__ == "__main__":
             "Admin: pick the tech and the first and last day, then press Book holiday. Every weekday in between gets a red "
             "'JAY HOLIDAY' line (white text) at the top of that day on the schedule, and the tech counts as off - no free "
             "hours that day in New Request, Unallocated Jobs or Edit Schedule.",
-            "Booking ahead is fine: days in a month that hasn't got a tab yet are kept on a 'Holidays' tab and go on the "
-            "schedule automatically once the month's tab is made. Don't edit that tab by hand.",
+            "The red line on the schedule is the only record - there's no separate holidays list. A month needs its tab "
+            "on the schedule before you can book days in it.",
             "If the tech already has jobs on those days, it lists them so you can move them in Edit Schedule.",
             "Admin: tick Cancel in Coming up and press the button to take a holiday off (the red line comes off the schedule too).",
             "Holidays typed on the schedule by hand (e.g. 'JAY HOLIDAY') still count and show on the calendar.",
@@ -2385,12 +2298,6 @@ if __name__ == "__main__":
         else:
             st.error(f"Can't open the cad schedule: {msg or name}")
         st.stop()
-    if not st.session_state.get("hol_synced"):         # holidays booked for a month that now has its tab
-        st.session_state["hol_synced"] = True
-        try:
-            sync_holidays()
-        except Exception:
-            pass
     if tool == "New Request":
         new_request()
     elif tool == "Unallocated Jobs":
