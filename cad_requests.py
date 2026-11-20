@@ -3,7 +3,8 @@ CAD Requests - the front door to the cad schedule (Google Sheet).
 
   New Request      PM fills in a short form -> a row goes into this month's tab under the date, Drw. by left blank
   Unallocated Jobs everything with no CAD tech yet -> pick who gets it, press Save
-  Change CAD Tech  a job already given out -> pick someone else, press Save (same day, moves into their lines)
+  Edit Schedule    a job already given out -> move it to another day and/or give it to someone else, press Save
+  Holidays         month calendar of who's off; admin books / cancels holidays (red 'JAY HOLIDAY' lines on the schedule)
   Find a Job       every time a job number has been on the schedule, plus its Clarity folder
 
 Needs (requirements.txt): streamlit, gspread, google-auth, pandas
@@ -711,9 +712,19 @@ def month_tabs(around):
     return out
 
 
+def with_booked_holidays(load):
+    """Add holidays from the Holidays tab (incl. months whose tab isn't made yet) to tech_load's 'off' set."""
+    booked, off, days = load
+    try:
+        off = set(off) | {(h["Date"], h["Tech"]) for h in holidays_booked()}
+    except Exception:
+        pass
+    return booked, off, days
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_snapshot(today):
-    return tech_load(month_tabs(today))
+    return with_booked_holidays(tech_load(month_tabs(today)))
 
 
 def move_job(tab, row, job, site, notes, tech, day):
@@ -966,6 +977,252 @@ def given_out(today, back_days=0):
                             "Client": r[C_CLIENT].strip(), "Site": r[C_SITE].strip(), "PM": r[C_PM].strip(),
                             "Hrs": r[C_TIME].strip(), "Drw. by": tech, "Notes": r[C_NOTES].strip()})
     return out
+
+
+# --------------------------------------------------------------------------------------
+# Edit schedule: move a given-out job to another day (and/or another tech)
+# --------------------------------------------------------------------------------------
+def get_note(w, r):
+    """The cell note on row r's Notes cell (the full request text), or ''."""
+    c = col_letter(C_NOTES + getattr(w, "off", 0))
+    try:
+        meta = w.spreadsheet.fetch_sheet_metadata(params={"ranges": f"'{w.title}'!{c}{r}", "includeGridData": "true",
+                                                          "fields": "sheets.data.rowData.values.note"})
+        rows = meta["sheets"][0]["data"][0].get("rowData", [])
+        return ((rows[0].get("values") or [{}])[0].get("note") or "") if rows else ""
+    except Exception:
+        return ""
+
+
+def block_of(values, month, i):
+    """(day, heading, end) of the day block that 0-based row i sits in, or None."""
+    return next(((d, h, e) for d, h, e in day_blocks(values, month) if h < i < e), None)
+
+
+def take_off_day(w, tab, t, tech):
+    """Take tech's job line (row t, 1-based) off its day. If tech has other lines that day the row goes; if it was
+    their only one it becomes their empty line again (just their initials), so the day keeps its layout."""
+    month = tab_month(tab)
+    values = w.get_all_values()
+    blk = block_of(values, month, t - 1)
+    d = blk[0] if blk else None
+    others = blk and any(i != t - 1 and pad(values[i])[C_DRAWN].strip().upper() == tech.upper()
+                         and (is_job_row(values[i]) or is_tech_blank(values[i])) for i in range(blk[1] + 1, blk[2]))
+    if others:
+        w.delete_rows(t)
+    else:
+        line = [""] * (C_DWG + 1)
+        line[C_DRAWN] = tech
+        w.update(range_name=f"A{t}:I{t}", values=[line])
+        try:
+            c = C_NOTES + getattr(w, "off", 0)
+            w.spreadsheet.batch_update({"requests": [{"updateCells": {
+                "range": {"sheetId": w.id, "startRowIndex": t - 1, "endRowIndex": t, "startColumnIndex": c, "endColumnIndex": c + 1},
+                "rows": [{"values": [{}]}], "fields": "note"}}]})
+            if hasattr(w, "clear_done"):
+                w.clear_done(t)
+            w.format(f"A{t}:I{t}", {"textFormat": {"foregroundColor": BLACK, "bold": False}})
+            colour_rows(w, {t: tech})
+        except Exception:
+            pass
+    if d:
+        fix_day_total(w, d)
+    return d
+
+
+def move_assigned(tab, row, job, site, old, new, day):
+    """Move a job line that's with 'old' to 'day' (a different day), given to 'new' (can be the same tech).
+    Keeps its priority / URGENT and the full request note. Returns (tab, row, day it landed on) or None if the
+    line can't be found any more. If it can't go on the new day, it's put back where it was."""
+    w = ws(tab)
+    values = w.get_all_values()
+    t = find_assigned(values, row, job, site, old)
+    if t is None:
+        return None
+    line = pad(values[t - 1])[:C_DWG + 1]
+    note = get_note(w, t)
+    urgent = line[0].strip().upper() == "URGENT"
+    was = take_off_day(w, tab, t, old)
+    line[C_DRAWN] = new
+    try:
+        return add_request(day, line, urgent, note)
+    except Exception:
+        if was:                                   # couldn't go on the new day - put it back on its old day
+            line[C_DRAWN] = old
+            add_request(was, line, urgent, note)
+        raise
+
+
+# --------------------------------------------------------------------------------------
+# Holidays: a 'Holidays' tab keeps every booked day (so months that haven't got a tab yet still count), and each
+# day gets a red 'JAY HOLIDAY' line on the schedule under its date as soon as that month's tab exists.
+# --------------------------------------------------------------------------------------
+HOL_TAB = "Holidays"
+HOL_COLS = ["Tech", "Date", "Booked", "On schedule"]
+HOL_RED = {"red": 0.85, "green": 0.11, "blue": 0.11}
+WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
+
+
+def hol_text(t):
+    return f"{(CAD_NAMES.get(t.upper()) or [t.upper()])[0]} HOLIDAY"
+
+
+def is_holiday_line(row, tech=None):
+    """A 'JAY HOLIDAY' line (any tech, or just that tech's)."""
+    r = pad(row)
+    text = " ".join(r[1:C_DWG + 1]).upper()
+    if "HOLIDAY" not in text or is_job_row(r):
+        return False
+    if tech is None:
+        return True
+    return any(n in text for n in CAD_NAMES.get(tech.upper(), [tech.upper()]))
+
+
+def hol_ws(create=False):
+    for w in book().worksheets():
+        if w.title.strip().lower() == HOL_TAB.lower():
+            return w
+    if not create:
+        return None
+    w = book().add_worksheet(HOL_TAB, rows=400, cols=len(HOL_COLS))
+    w.update(range_name="A1", values=[HOL_COLS])
+    return w
+
+
+def parse_day(s):
+    for f in ("%d/%m/%Y", "%Y-%m-%d", "%d/%m/%y"):
+        try:
+            return dt.datetime.strptime(str(s).strip(), f).date()
+        except ValueError:
+            pass
+    return None
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def holidays_booked():
+    """Every day on the Holidays tab: [{Tech, Date, Row, On schedule}]."""
+    w = hol_ws()
+    if w is None:
+        return []
+    out = []
+    for i, r in enumerate(w.get_all_values()[1:], 2):
+        r = pad(r, len(HOL_COLS))
+        d, t = parse_day(r[1]), r[0].strip().upper()
+        if d and t:
+            out.append({"Tech": t, "Date": d, "Row": i, "On schedule": r[3].strip()})
+    return out
+
+
+def put_holiday_line(d, tech):
+    """Red 'JAY HOLIDAY' line straight under the date heading. Returns 'added', 'there', 'no tab' or 'no date'."""
+    w = ws(tab_name(d))
+    if w is None:
+        return "no tab"
+    values = w.get_all_values()
+    blk = next(((h, e) for dd, h, e in day_blocks(values, d.replace(day=1)) if dd == d), None)
+    if not blk:
+        return "no date"
+    h, e = blk
+    if any(is_holiday_line(values[i], tech) for i in range(h + 1, e)):
+        return "there"
+    line = [""] * (C_DWG + 1)
+    line[C_CLIENT] = hol_text(tech)
+    at = h + 2
+    w.insert_row(line, index=at, inherit_from_before=False)
+    off = getattr(w, "off", 0)
+    g = lambda c0, c1: {"sheetId": w.id, "startRowIndex": at - 1, "endRowIndex": at, "startColumnIndex": c0, "endColumnIndex": c1}
+    side = {"style": "SOLID", "width": 1}
+    reqs = [{"repeatCell": {"range": g(off, C_DWG + 1 + off), "cell": {"userEnteredFormat": {
+        "backgroundColor": HOL_RED, "textFormat": {"foregroundColor": WHITE, "bold": True}}},
+        "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat"}},
+        {"updateBorders": {"range": g(off, C_DWG + 1 + off), "top": side, "bottom": side, "left": side, "right": side}}]
+    if off:                                        # no Done tick-box / priority dropdown on a holiday line
+        reqs.append({"setDataValidation": {"range": g(0, 2)}})
+        reqs.append({"updateCells": {"range": g(0, 2), "rows": [{"values": [{}, {}]}], "fields": "userEnteredValue"}})
+    try:
+        w.spreadsheet.batch_update({"requests": reqs})
+    except Exception:
+        pass
+    fix_day_total(w, d)
+    return "added"
+
+
+def take_holiday_line(d, tech):
+    """Take tech's holiday line off day d. Returns True if one was there."""
+    w = ws(tab_name(d))
+    if w is None:
+        return False
+    values = w.get_all_values()
+    blk = next(((h, e) for dd, h, e in day_blocks(values, d.replace(day=1)) if dd == d), None)
+    if not blk:
+        return False
+    h, e = blk
+    hit = next((i for i in range(h + 1, e) if is_holiday_line(values[i], tech)), None)
+    if hit is None:
+        return False
+    rest = [i for i in range(h + 1, e) if i != hit and not is_blank(pad(values[i])[:C_DWG + 1])]
+    if rest:
+        w.delete_rows(hit + 1)
+    else:                                          # the only thing under the date - empty it, keep the row
+        w.update(range_name=f"A{hit + 1}:I{hit + 1}", values=[[""] * (C_DWG + 1)])
+        try:
+            w.format(f"A{hit + 1}:I{hit + 1}", {"backgroundColor": WHITE, "textFormat": {"foregroundColor": BLACK, "bold": False}})
+        except Exception:
+            pass
+    fix_day_total(w, d)
+    return True
+
+
+def working_days(a, b):
+    return [a + dt.timedelta(days=k) for k in range((b - a).days + 1) if (a + dt.timedelta(days=k)).weekday() < 5]
+
+
+def book_holiday(tech, a, b):
+    """Book tech off every weekday from a to b. Returns {day: result}."""
+    w = hol_ws(create=True)
+    have = {(h["Tech"], h["Date"]) for h in holidays_booked()}
+    out, new = {}, []
+    for d in working_days(a, b):
+        res = put_holiday_line(d, tech)
+        out[d] = res
+        if (tech, d) not in have:
+            mark = {"added": "Yes", "there": "Yes", "no date": "No date"}.get(res, "")
+            new.append([tech, f"{d:%d/%m/%Y}", f"{uk_now():%d/%m/%Y %H:%M}", mark])
+    if new:
+        w.append_rows(new, value_input_option="RAW")
+    holidays_booked.clear()
+    load_snapshot.clear()
+    return out
+
+
+def cancel_holiday(tech, d):
+    w = hol_ws()
+    if w is not None:
+        rows = [h["Row"] for h in holidays_booked() if h["Tech"] == tech and h["Date"] == d]
+        for r in sorted(rows, reverse=True):
+            w.delete_rows(r)
+    take_holiday_line(d, tech)
+    holidays_booked.clear()
+    load_snapshot.clear()
+
+
+def sync_holidays():
+    """Holidays booked for a month that had no tab yet: put their lines on now the tab's there."""
+    w = hol_ws()
+    if w is None:
+        return 0
+    n, today = 0, dt.date.today()
+    for h in holidays_booked():
+        if h["On schedule"] or h["Date"] < today - dt.timedelta(days=7):
+            continue
+        res = put_holiday_line(h["Date"], h["Tech"])
+        if res in ("added", "there", "no date"):
+            w.update(range_name=f"D{h['Row']}", values=[["Yes" if res != "no date" else "No date"]])
+            n += res == "added"
+    if n:
+        holidays_booked.clear()
+        load_snapshot.clear()
+    return n
 
 
 # --------------------------------------------------------------------------------------
@@ -1327,7 +1584,7 @@ def availability_table(booked, off, days, start, n=10):
 def unallocated():
     today = dt.date.today()
     tabs = month_tabs(today)
-    booked, off, days = tech_load(tabs)
+    booked, off, days = with_booked_holidays(tech_load(tabs))
     rows = []
     prev_t, cur_t = tab_name((today.replace(day=1) - dt.timedelta(days=1))), tab_name(today)
     for t, v in tabs.items():
@@ -1712,12 +1969,13 @@ def weekly_report():
                f"{sum(S['per'][t]['Lines with hours'] for t in techs)} of {S['lines']} lines had hours on them.")
 
 
-def change_tech_screen():
+def edit_schedule_screen():
     today = dt.date.today()
     c1, c2, c3 = st.columns([2, 1, 1])
     past = c2.toggle("Show the last 2 weeks too", key="ct_past")
     if c3.button("Refresh", key="ct_ref", use_container_width=True):
         given_out.clear()
+        load_snapshot.clear()
         st.rerun()
     rows = given_out(today, 14 if past else 0)
     if not rows:
@@ -1731,45 +1989,71 @@ def change_tech_screen():
         return
     df = pd.DataFrame(rows)
     df["Day"] = df["Date"].apply(lambda d: f"{d:%a %d-%b}")
-    df.insert(0, "Change to", None)
-    cols = ["Change to", "Day", "Drw. by", "Pri", "Job", "Client", "Site", "PM", "Hrs", "Notes", "Tab", "Row"]
+    df.insert(0, "Move to", None)
+    df.insert(1, "Change to", None)
+    df["Move to"] = pd.Series([None] * len(df), dtype="object")
+    cols = ["Move to", "Change to", "Day", "Drw. by", "Pri", "Job", "Client", "Site", "PM", "Hrs", "Notes", "Tab", "Row"]
     ed = st.data_editor(df[cols], hide_index=True, use_container_width=True, key=f"ct_ed_{st.session_state.get('ct_n', 0)}",
-                        column_config={"Change to": st.column_config.SelectboxColumn("Change to", options=CAD_TEAM, width="small"),
+                        column_config={"Move to": st.column_config.DateColumn("Move to", format="ddd DD-MMM", width="small",
+                                                                              min_value=today - dt.timedelta(days=14),
+                                                                              help="Pick a new day for this job"),
+                                       "Change to": st.column_config.SelectboxColumn("Change to", options=CAD_TEAM, width="small",
+                                                                                     help="Give it to a different CAD tech"),
                                        "Drw. by": st.column_config.TextColumn("Now with", width="small"),
                                        "Tab": None, "Row": None},
-                        disabled=[c for c in cols if c != "Change to"])
+                        disabled=[c for c in cols if c not in ("Move to", "Change to")])
     ed["Date"] = df["Date"]
-    picks = ed[ed["Change to"].notna() & (ed["Change to"].astype(str).str.upper() != ed["Drw. by"].astype(str).str.upper())]
+    to_day = lambda r: pd.to_datetime(r["Move to"]).date() if pd.notna(r["Move to"]) and r["Move to"] != "" else r["Date"]
+    to_tech = lambda r: str(r["Change to"]).upper() if pd.notna(r["Change to"]) and r["Change to"] else r["Drw. by"]
+    picks = ed[ed.apply(lambda r: to_day(r) != r["Date"] or to_tech(r) != r["Drw. by"].upper(), axis=1)]
     if picks.empty:
-        st.caption("Pick a name in 'Change to' for any line, then press Save.")
+        st.caption("Pick a new day in 'Move to' and/or a name in 'Change to' for any line, then press Save.")
         return
     booked, off, _ = load_snapshot(today)
-    sim, chk = dict(booked), []
-    for _, r in picks.iterrows():
-        d, old, new, hrs = r["Date"], r["Drw. by"], r["Change to"], hours_of(r["Hrs"])
-        sim[(d, old)] = sim.get((d, old), 0.0) - hrs
+    sim, chk, plan = dict(booked), [], []
+    for idx, r in picks.iterrows():
+        d0, old, hrs = r["Date"], r["Drw. by"], hours_of(r["Hrs"])
+        d, new = to_day(r), to_tech(r)
+        sim[(d0, old)] = sim.get((d0, old), 0.0) - hrs
         sim[(d, new)] = sim.get((d, new), 0.0) + hrs
-        if (d, new) in off:
-            res = f"{new} is off that day"
+        if d.weekday() >= 5:
+            res = f"{d:%a %d-%b} is a weekend - it'll go on the next working day"
+        elif (d, new) in off:
+            res = f"{new} is on holiday that day"
         elif sim[(d, new)] > DAY_HOURS:
             res = f"{new} would be on {sim[(d, new)]:g}h that day (over {DAY_HOURS:g})"
         else:
             res = f"OK - {new} on {sim[(d, new)]:g}h that day"
-        chk.append({"Job": r["Job"], "Site": r["Site"], "Day": r["Day"], "From": old, "To": new, "Hrs": r["Hrs"], "Check": res})
+        what = []
+        if d != d0:
+            what.append(f"{d0:%a %d-%b} -> {d:%a %d-%b}")
+        if new != old:
+            what.append(f"{old} -> {new}")
+        chk.append({"Job": r["Job"], "Site": r["Site"], "Change": ", ".join(what), "Hrs": r["Hrs"], "Check": res})
+        plan.append((idx, d, new))
     st.dataframe(pd.DataFrame(chk), hide_index=True, use_container_width=True)
     if st.button(f"Save ({len(picks)})", type="primary", key="ct_save"):
         msgs, skipped = [], []
-        for _, r in picks.iterrows():
-            try:
-                res = change_tech(r["Tab"], int(r["Row"]), r["Job"], r["Site"], r["Drw. by"], r["Change to"])
-            except Exception as e:
-                res = None
-                skipped.append(f"{r['Job']} {r['Site']} ({e})")
-                continue
-            if res is None:
-                skipped.append(f"{r['Job']} {r['Site']}")
-            else:
-                msgs.append(f"{r['Job']} {r['Site']} ({r['Day']}): {r['Drw. by']} -> {r['Change to']}")
+        with st.spinner("Updating the schedule..."):
+            for idx, d, new in plan:
+                r = picks.loc[idx]
+                old = r["Drw. by"]
+                try:
+                    if d == r["Date"]:
+                        res = change_tech(r["Tab"], int(r["Row"]), r["Job"], r["Site"], old, new)
+                        landed = r["Date"]
+                    else:
+                        res = move_assigned(r["Tab"], int(r["Row"]), r["Job"], r["Site"], old, new, d)
+                        landed = res[2] if res else None
+                except Exception as e:
+                    skipped.append(f"{r['Job']} {r['Site']} ({e})")
+                    continue
+                if res is None:
+                    skipped.append(f"{r['Job']} {r['Site']}")
+                else:
+                    bits = ([f"{r['Day']} -> {landed:%a %d-%b}"] if landed != r["Date"] else []) + \
+                           ([f"{old} -> {new}"] if new != old else [])
+                    msgs.append(f"{r['Job']} {r['Site']}: " + ", ".join(bits))
         given_out.clear()
         all_history.clear()
         load_snapshot.clear()
@@ -1778,13 +2062,130 @@ def change_tech_screen():
         st.rerun()
 
 
-def change_tech_page():
+def edit_schedule_page():
     msgs, skipped = st.session_state.pop("ct_msg", ([], []))
     if msgs:
-        st.success("Changed: " + "; ".join(msgs))
+        st.success("Done: " + "; ".join(msgs))
     if skipped:
-        st.warning("Couldn't change these (moved, changed or deleted since) - press Refresh and try again: " + "; ".join(skipped))
-    change_tech_screen()
+        st.warning("Couldn't do these (moved, changed or deleted since) - press Refresh and try again: " + "; ".join(skipped))
+    edit_schedule_screen()
+
+
+def holiday_days(start, end):
+    """{(day, tech)} off between start and end - booked on the Holidays tab or typed on the schedule."""
+    try:
+        _, off, _ = load_snapshot(dt.date.today())
+    except Exception:
+        off = {(h["Date"], h["Tech"]) for h in holidays_booked()}
+    return {(d, t) for d, t in off if start <= d <= end}
+
+
+def month_calendar(month, off):
+    """Mon-Fri grid for a month, each day with a red box per tech on holiday."""
+    import calendar
+    today = dt.date.today()
+    cells = []
+    for week in calendar.Calendar().monthdatescalendar(month.year, month.month):
+        tds = []
+        for d in week[:5]:
+            if d.month != month.month:
+                tds.append('<td class="hc-out"></td>')
+                continue
+            chips = "".join(f'<div class="hc-hol">{hol_text(t)}</div>' for t in CAD_TEAM if (d, t) in off)
+            cls = "hc-today" if d == today else ""
+            tds.append(f'<td class="{cls}"><div class="hc-n">{d.day}</div>{chips}</td>')
+        cells.append("<tr>" + "".join(tds) + "</tr>")
+    head = "".join(f"<th>{x}</th>" for x in ("Mon", "Tue", "Wed", "Thu", "Fri"))
+    return f"""
+<style>
+  .hc {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
+  .hc th {{ text-align: left; padding: 6px 8px; font-size: .85rem; opacity: .7; }}
+  .hc td {{ border: 1px solid rgba(128,128,128,.35); vertical-align: top; height: 86px; padding: 6px; }}
+  .hc td.hc-out {{ background: rgba(128,128,128,.08); }}
+  .hc td.hc-today {{ outline: 2px solid {BRAND}; outline-offset: -2px; }}
+  .hc .hc-n {{ font-weight: 600; font-size: .9rem; margin-bottom: 4px; }}
+  .hc .hc-hol {{ background: #D91C1C; color: #fff; font-weight: 700; font-size: .78rem; padding: 3px 6px; margin-top: 3px;
+                border-radius: 3px; }}
+</style>
+<table class="hc"><tr>{head}</tr>{''.join(cells)}</table>"""
+
+
+def holidays_screen():
+    today = dt.date.today()
+    msg = st.session_state.pop("hol_msg", None)
+    if msg:
+        (st.success if msg[0] == "ok" else st.warning)(msg[1])
+    k = st.session_state.get("hol_m", 0)
+    n = today.year * 12 + today.month - 1 + k
+    month = dt.date(n // 12, n % 12 + 1, 1)
+    c1, c2, c3, c4 = st.columns([1, 3, 1, 1])
+    if c1.button("◀ Prev", key="hol_prev", use_container_width=True):
+        st.session_state["hol_m"] = k - 1
+        st.rerun()
+    c2.markdown(f"### {month:%B %Y}")
+    if c3.button("Next ▶", key="hol_next", use_container_width=True):
+        st.session_state["hol_m"] = k + 1
+        st.rerun()
+    if c4.button("Refresh", key="hol_ref", use_container_width=True):
+        holidays_booked.clear()
+        load_snapshot.clear()
+        st.rerun()
+    end = (month + dt.timedelta(days=32)).replace(day=1) - dt.timedelta(days=1)
+    off = holiday_days(month, end)
+    st.markdown(month_calendar(month, off), unsafe_allow_html=True)
+
+    if is_admin():
+        st.divider()
+        st.subheader("Book a holiday")
+        b1, b2 = st.columns([1, 2])
+        tech = b1.radio("CAD tech", CAD_TEAM, horizontal=True, key="hol_tech")
+        span = b2.date_input("From - to (pick the first day, then the last)", value=(today, today), min_value=today - dt.timedelta(days=7),
+                             format="DD/MM/YYYY", key="hol_span")
+        a, b = (span[0], span[-1]) if isinstance(span, (list, tuple)) and span else (span, span)
+        days = working_days(a, b) if a and b else []
+        if days:
+            st.caption(f"{tech}: {len(days)} working day(s), {days[0]:%a %d-%b} to {days[-1]:%a %d-%b}. Weekends are skipped.")
+            clash = [r for r in given_out(today, 7) if r["Drw. by"] == tech and r["Date"] in days]
+            if clash:
+                st.warning(f"{tech} has {len(clash)} job(s) on those days - move them in **Edit Schedule** after booking: "
+                           + "; ".join(f"{r['Date']:%a %d-%b} {r['Job']} {r['Site']}" for r in clash))
+        if st.button("Book holiday", type="primary", key="hol_book", disabled=not days):
+            with st.spinner("Adding it to the schedule..."):
+                res = book_holiday(tech, a, b)
+            on = sum(1 for v in res.values() if v in ("added", "there"))
+            later = sum(1 for v in res.values() if v == "no tab")
+            nodate = [d for d, v in res.items() if v == "no date"]
+            txt = f"{hol_text(tech)} booked for {len(res)} day(s). {on} on the schedule now."
+            if later:
+                txt += f" {later} day(s) are in a month with no tab yet - they go on automatically once the tab's made."
+            if nodate:
+                txt += " No date heading on the schedule for " + ", ".join(f"{d:%a %d-%b}" for d in nodate) + " (bank holiday?)."
+            given_out.clear()
+            st.session_state["hol_msg"] = ("ok", txt)
+            st.rerun()
+
+    st.divider()
+    st.subheader("Coming up")
+    soon = sorted({(d, t) for d, t in holiday_days(today, today + dt.timedelta(days=400))})
+    if not soon:
+        st.caption("No holidays booked from today on.")
+        return
+    df = pd.DataFrame([{"Day": f"{d:%a %d-%b-%Y}", "CAD tech": t, "Date": d} for d, t in soon])
+    if is_admin():
+        df.insert(0, "Cancel", False)
+    ed = st.data_editor(df, hide_index=True, use_container_width=True, key=f"hol_ed_{st.session_state.get('hol_n', 0)}",
+                        column_config={"Date": None, "Cancel": st.column_config.CheckboxColumn("Cancel", width="small")},
+                        disabled=["Day", "CAD tech"])
+    if is_admin():
+        gone = ed[ed["Cancel"] == True]                                  # noqa: E712
+        if not gone.empty and st.button(f"Cancel {len(gone)} day(s)", key="hol_cancel"):
+            with st.spinner("Taking it off the schedule..."):
+                for _, r in gone.iterrows():
+                    cancel_holiday(r["CAD tech"], r["Date"])
+            st.session_state["hol_n"] = st.session_state.get("hol_n", 0) + 1
+            st.session_state["hol_msg"] = ("ok", f"Cancelled {len(gone)} day(s) - the red lines are off the schedule.")
+            st.rerun()
+
 
 
 def find_job():
@@ -1877,7 +2278,8 @@ if __name__ == "__main__":
     TOOL_HELP = {
         "New Request": "Ask the CAD team for artwork",
         "Unallocated Jobs": "Give waiting jobs to a CAD tech",
-        "Change CAD Tech": "Move a job to a different CAD tech",
+        "Edit Schedule": "Move jobs to another day or CAD tech",
+        "Holidays": "Who's off, and book holidays",
         "Find a Job": "Job history and Clarity folder",
         "Saved Requests": "Every request made, for reference",
         "Drawing Numbers": "Next number per tech, and clashes",
@@ -1904,15 +2306,28 @@ if __name__ == "__main__":
             "just emptied so the day keeps its layout. The request stays in Saved Requests, marked as deleted.",
             "If someone's added lines since you opened the page, it finds the job again before writing, so nothing lands on the wrong row.",
         ],
-        "Change CAD Tech": [
+        "Edit Schedule": [
             "Lists every line that's already been given to a CAD tech, from today on, that isn't ticked Done. "
             "Switch on 'Show the last 2 weeks too' for older lines.",
-            "Pick the new name in 'Change to' for as many lines as you like, check the hours, then press Save.",
-            "The line stays on the same day. It moves down into the new tech's lines and is re-coloured, keeping its "
-            "Done tick, priority, URGENT red and note. The day's hours total is redone.",
-            "If the new tech only had their empty line that day, the job takes its place (or the empty line goes to the "
-            "old tech if they've now got nothing that day).",
-            "The check warns if it puts the new tech over 8 hours or on a day off, but it still lets you save.",
+            "Pick a new day in 'Move to' to move a job to that day, and/or a name in 'Change to' to give it to someone else. "
+            "Do as many lines as you like, check the hours, then press Save.",
+            "A moved job goes under the new day in that tech's lines (into their empty line if that's all they had), keeping "
+            "its priority, URGENT red and the full request note, and is sorted by priority. If it was the tech's only job on "
+            "the old day, that line goes back to being their empty line. Both days' hours totals are redone.",
+            "Changing the tech on the same day moves the line into the new tech's lines, as before.",
+            "The check warns if it puts the tech over 8 hours, on a holiday or on a weekend (that goes on the next working "
+            "day that week), but it still lets you save.",
+        ],
+        "Holidays": [
+            "The calendar shows each month Mon-Fri with a red box for every CAD tech on holiday. Use Prev / Next to change month.",
+            "Admin: pick the tech and the first and last day, then press Book holiday. Every weekday in between gets a red "
+            "'JAY HOLIDAY' line (white text) at the top of that day on the schedule, and the tech counts as off - no free "
+            "hours that day in New Request, Unallocated Jobs or Edit Schedule.",
+            "Booking ahead is fine: days in a month that hasn't got a tab yet are kept on a 'Holidays' tab and go on the "
+            "schedule automatically once the month's tab is made. Don't edit that tab by hand.",
+            "If the tech already has jobs on those days, it lists them so you can move them in Edit Schedule.",
+            "Admin: tick Cancel in Coming up and press the button to take a holiday off (the red line comes off the schedule too).",
+            "Holidays typed on the schedule by hand (e.g. 'JAY HOLIDAY') still count and show on the calendar.",
         ],
         "Drawing Numbers": [
             "Shows the next drawing number for each tech, worked out from the Drw. No. column on the schedule.",
@@ -1970,12 +2385,20 @@ if __name__ == "__main__":
         else:
             st.error(f"Can't open the cad schedule: {msg or name}")
         st.stop()
+    if not st.session_state.get("hol_synced"):         # holidays booked for a month that now has its tab
+        st.session_state["hol_synced"] = True
+        try:
+            sync_holidays()
+        except Exception:
+            pass
     if tool == "New Request":
         new_request()
     elif tool == "Unallocated Jobs":
         unallocated()
-    elif tool == "Change CAD Tech":
-        change_tech_page()
+    elif tool == "Edit Schedule":
+        edit_schedule_page()
+    elif tool == "Holidays":
+        holidays_screen()
     elif tool == "Saved Requests":
         saved_screen()
     elif tool == "Weekly Report":
